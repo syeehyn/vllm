@@ -232,6 +232,12 @@ class ParallelConfig:
     - "passthrough": No all2all at all: the MoE backend dispatches and combines
       itself (e.g. the FlashInfer MoE-EP megakernels). Bound automatically for
       such MoE backends; not selectable from the CLI."""
+    enable_sequence_parallel_moe: bool = False
+    """Allow model-selected sequence-parallel MoE with a single DP rank.
+
+    Model config hooks enable this before communication groups are created.
+    The model must shard its inputs and set FusedMoE's is_sequence_parallel.
+    """
 
     max_parallel_loading_workers: int | None = Field(default=None, ge=1)
     """Maximum number of parallel loading workers when loading model
@@ -249,6 +255,12 @@ class ParallelConfig:
     most beneficial for multimodal serving with large images and tensor
     parallelism. Active only when all queue readers are node-local; reserves
     slots in ``/dev/shm``."""
+
+    hier_all_reduce_islands: str = ""
+    """Island partition enabling the hierarchical all-reduce, as
+    semicolon-separated rank groups, e.g. `"0,1,2,3;4,5,6,7"` for a 2x4 PCIe box
+    whose GPUs form two PIX islands bridged by the CPU interconnect. Empty
+    disables it. The partition must cover ranks `0..world_size-1` exactly."""
 
     enable_elastic_ep: bool = False
     """Enable elastic expert parallelism with stateless NCCL groups for DP/EP."""
@@ -781,7 +793,7 @@ class ParallelConfig:
             )
             and self.enable_expert_parallel
             and self.tensor_parallel_size > 1
-            and self.data_parallel_size > 1
+            and (self.data_parallel_size > 1 or self.enable_sequence_parallel_moe)
         )
 
     @property

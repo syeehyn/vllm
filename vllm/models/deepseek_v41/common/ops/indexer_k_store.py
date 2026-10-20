@@ -19,6 +19,10 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
 from vllm.v1.attention.ops.common import pack_ue8m0_x4
+from vllm.v1.attention.ops.fp8_e4m3_portable import (
+    float_to_e4m3_bytes,
+    has_native_fp8e4nv,
+)
 
 from . import MXFP4_BLOCK_SIZE, _fp32x2_to_fp4x2
 
@@ -115,6 +119,7 @@ def indexer_k_norm_rope_store(
         FP8_MAX=448.0,
         USE_FP4=use_fp4_cache,
         MX_SCALE=not use_fp4_cache and mqa_logits_use_mx_scales(),
+        NATIVE_FP8=has_native_fp8e4nv(),
         SHUFFLE=shuffle,
         BLOCK_TILE_SIZE=_BLOCK_TILE_SIZE,
         HEAD_TILE_SIZE=_HEAD_TILE_SIZE,
@@ -144,6 +149,7 @@ def _indexer_k_norm_rope_quant_store_kernel(
     FP8_MAX: tl.constexpr,
     USE_FP4: tl.constexpr,
     MX_SCALE: tl.constexpr,
+    NATIVE_FP8: tl.constexpr,
     SHUFFLE: tl.constexpr,
     BLOCK_TILE_SIZE: tl.constexpr,
     HEAD_TILE_SIZE: tl.constexpr,
@@ -248,7 +254,7 @@ def _indexer_k_norm_rope_quant_store_kernel(
         exponent = tl.ceil(tl.log2(absmax * INV_FP8_MAX))
         inv_scale = tl.exp2(-exponent)
         x_clamped = tl.clamp(result_bf16 * inv_scale, -FP8_MAX, FP8_MAX)
-        x_uint8 = x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+        x_uint8 = float_to_e4m3_bytes(x_clamped, NATIVE_FP8)
         if SHUFFLE:
             tiled = (
                 block // HEAD_TILE_SIZE * BLOCK_TILE_SIZE * HEAD_TILE_SIZE

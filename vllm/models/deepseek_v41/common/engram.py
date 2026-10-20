@@ -77,6 +77,10 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+from vllm.v1.attention.ops.fp8_e4m3_portable import (
+    e4m3_bytes_to_float,
+    has_native_fp8e4nv,
+)
 
 logger = init_logger(__name__)
 
@@ -658,6 +662,7 @@ def _engram_lookup_kernel(
     SORTED: tl.constexpr if _SORTED_IS_CONSTEXPR else None,  # type: ignore[valid-type]
     PACKED: tl.constexpr,
     OUT_STRIDE: tl.constexpr,
+    PORTABLE_FP8: tl.constexpr = False,
 ):
     """Gather FP8 rows as packed values/scales or dequantized BF16.
 
@@ -688,11 +693,21 @@ def _engram_lookup_kernel(
             owned &= (index >= vocab_start) & (index < vocab_end)
             local = index - vocab_start
         local = tl.where(owned, local, 0)
-        values = tl.load(
-            weight + local[:, None] * DIM + cols[None, :],
-            mask=owned[:, None],
-            other=0.0,
-        )
+        # PORTABLE_FP8: `weight` is a uint8 view of the same E4M3 rows, for
+        # architectures whose Triton backend rejects the fp8e4nv type.
+        if PORTABLE_FP8:
+            raw = tl.load(
+                weight + local[:, None] * DIM + cols[None, :],
+                mask=owned[:, None],
+                other=0,
+            )
+            values = e4m3_bytes_to_float(raw, False)
+        else:
+            values = tl.load(
+                weight + local[:, None] * DIM + cols[None, :],
+                mask=owned[:, None],
+                other=0.0,
+            )
         scale = tl.load(
             scales + local[:, None] * (DIM // QUANT_BLOCK) + scale_cols[None, :],
             mask=owned[:, None],
@@ -1139,6 +1154,9 @@ class ParallelEngramEmbedding(nn.Module):
                 local = nn.functional.pad(local, (0, pad), value=-1)
             indices, dst = local.flatten().sort()
             dst = dst.int()
+        portable_fp8 = weight.dtype == torch.float8_e4m3fn and not has_native_fp8e4nv()
+        if portable_fp8:
+            weight = weight.view(torch.uint8)
         # The table dwarfs TLB reach, so a persistent grid near the SM count
         # beats one program per row; halve it to leave SMs for the main stream.
         tiles = triton.cdiv(rows, 16)
@@ -1164,6 +1182,7 @@ class ParallelEngramEmbedding(nn.Module):
             SORTED=sort,
             PACKED=out.dtype == torch.uint8,
             OUT_STRIDE=out.stride(0),
+            PORTABLE_FP8=portable_fp8,
         )
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
