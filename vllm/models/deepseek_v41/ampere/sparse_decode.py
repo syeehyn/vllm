@@ -23,6 +23,7 @@ from vllm.v1.attention.ops.fp8_e4m3_portable import (
     e4m3_bytes_to_float,
     has_native_fp8e4nv,
 )
+from vllm.v1.attention.ops.fp8e4nv import FP8E4NV_EXTERN_LIBS
 
 # The V4 per-token record: 448 FP8 dims in 64-wide UE8M0 blocks, then 64 BF16
 # RoPE dims, with a block's scales packed after all of its token data.
@@ -140,6 +141,7 @@ def _gather_dequant(
         N_QUANT_BLOCKS=_V4_SCALE_DIM,
         NATIVE_FP8=has_native_fp8e4nv(),
         num_warps=4,
+        **({} if has_native_fp8e4nv() else {"extern_libs": FP8E4NV_EXTERN_LIBS}),
     )
 
 

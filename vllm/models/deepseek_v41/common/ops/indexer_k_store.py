@@ -23,6 +23,11 @@ from vllm.v1.attention.ops.fp8_e4m3_portable import (
     float_to_e4m3_bytes,
     has_native_fp8e4nv,
 )
+from vllm.v1.attention.ops.fp8e4nv import FP8E4NV_EXTERN_LIBS
+
+
+def _fp8_extern_libs() -> dict:
+    return {} if has_native_fp8e4nv() else {"extern_libs": FP8E4NV_EXTERN_LIBS}
 
 from . import MXFP4_BLOCK_SIZE, _fp32x2_to_fp4x2
 
@@ -99,6 +104,7 @@ def indexer_k_norm_rope_store(
             )
 
     launch_kwargs = {"launch_pdl": False} if current_platform.is_cuda() else {}
+    launch_kwargs.update(_fp8_extern_libs())
     _indexer_k_norm_rope_quant_store_kernel[(num_tokens,)](
         k_pre,
         k_pre.stride(0),

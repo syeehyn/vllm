@@ -748,14 +748,19 @@ def sparse_attn_indexer(
                     )
                 else:
                     # SM80/SM121 Triton fallback (DeepGEMM unavailable).
+                    # Like DeepGEMM, row i holds K positions
+                    # [ks[i], ke[i]) starting at column zero, so the
+                    # candidate/row bounds are (None, ke - ks).
                     logits = fp8_mqa_logits_triton(
                         q_slice_cast,
                         (k_quant_cast, k_scale_cast),
-                        weights[chunk.token_start : chunk.token_end],
+                        weights[row_start:row_end],
                         cu_seqlen_ks,
                         cu_seqlen_ke,
                         clean_logits=False,
+                        max_seqlen_k=chunk.max_seqlen_k,
                     )
+                    row_ends = cu_seqlen_ke - cu_seqlen_ks
                 num_rows = logits.shape[0]
                 if candidate_blocks is not None:
                     # Two-level selection (v4.1): the candidate source

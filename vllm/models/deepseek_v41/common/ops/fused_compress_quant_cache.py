@@ -11,6 +11,11 @@ from vllm.v1.attention.ops.fp8_e4m3_portable import (
     float_to_e4m3_bytes,
     has_native_fp8e4nv,
 )
+from vllm.v1.attention.ops.fp8e4nv import FP8E4NV_EXTERN_LIBS
+
+
+def _fp8_extern_libs() -> dict:
+    return {} if has_native_fp8e4nv() else {"extern_libs": FP8E4NV_EXTERN_LIBS}
 
 if current_platform.is_rocm():
     from vllm.platforms.rocm import _ON_GFX950
@@ -327,6 +332,7 @@ def rope_quant_insert(
     if num_tokens == 0:
         return
     launch_kwargs = {"launch_pdl": False} if current_platform.is_cuda() else {}
+    launch_kwargs.update(_fp8_extern_libs())
     if kv_cache.dtype == torch.uint8:
         kernel = {
             584: _rope_quant_insert_kernel,
@@ -359,11 +365,18 @@ def rope_quant_insert(
     if store_fp8:
         assert fp8_scale is not None and fp8_scale.numel() == 1
         assert fp8_scale.dtype == torch.float32
+    # An fp8-typed pointer argument is itself unsupported on pre-SM89 Triton,
+    # so hand the kernel the same bytes as uint8 there.
+    cache_arg = (
+        kv_cache.view(torch.uint8)
+        if store_fp8 and not has_native_fp8e4nv()
+        else kv_cache
+    )
     _rope_plain_insert_kernel[(num_tokens,)](
         latent,
         positions,
         cos_sin_cache,
-        kv_cache,
+        cache_arg,
         slot_mapping,
         fp8_scale if store_fp8 else None,
         COS_STRIDE=cos_sin_cache.stride(0),
@@ -372,6 +385,7 @@ def rope_quant_insert(
         CACHE_BLOCK=kv_cache.shape[1],
         COMPRESS_RATIO=compress_ratio,
         STORE_FP8=store_fp8,
+        NATIVE_FP8=has_native_fp8e4nv(),
         num_warps=4,
         **launch_kwargs,
     )
@@ -556,6 +570,7 @@ def _rope_plain_insert_kernel(
     CACHE_BLOCK: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     STORE_FP8: tl.constexpr,
+    NATIVE_FP8: tl.constexpr = True,
 ):
     t = tl.program_id(0)
     slot = tl.load(cache_slots + t)
@@ -582,6 +597,10 @@ def _rope_plain_insert_kernel(
     )
     if STORE_FP8:
         scaled = row.to(tl.float32) * (1.0 / tl.load(fp8_scale))
-        tl.store(dst + d, tl.clamp(scaled, -448.0, 448.0).to(tl.float8e4nv))
+        # Store E4M3 bytes; on pre-SM89 the portable encoder names no fp8 type.
+        tl.store(
+            dst.to(tl.pointer_type(tl.uint8)) + d,
+            float_to_e4m3_bytes(tl.clamp(scaled, -448.0, 448.0), NATIVE_FP8),
+        )
     else:
         tl.store(dst + d, row)

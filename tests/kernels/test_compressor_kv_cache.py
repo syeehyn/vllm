@@ -34,6 +34,7 @@ from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
 )
 from vllm.models.deepseek_v4.compressor import _get_c128_boundary
 from vllm.platforms import current_platform
+from vllm.utils.import_utils import has_cutedsl_fp8
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
 )
@@ -520,6 +521,8 @@ def test_v41_fp8_gather_is_grid_width_invariant(gather_len, one_pass, monkeypatc
     whatever device is present: the wrapper picks the one-pass form on ROCm
     alone, so otherwise each platform would only ever see one of them.
     """
+    if one_pass and not current_platform.is_rocm():
+        pytest.skip("the one-pass gather kernel is the ROCm FNUZ variant")
     monkeypatch.setattr(current_platform, "is_rocm", lambda: one_pass)
     from vllm.models.deepseek_v41.common.ops import quantize_and_insert_k_cache
     from vllm.models.deepseek_v41.common.ops.cache_utils import (
@@ -661,7 +664,10 @@ def _decode_nvfp4_row(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tenso
     ).flatten(-2)
 
 
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(100),
+    reason="the 288 B NVFP4 KV record is SM100-only",
+)
 @pytest.mark.parametrize("compress_ratio", [1, 2])
 def test_v41_rope_insert_nvfp4_record(compress_ratio: int):
     """The 288-byte V4.1 NVFP4 record: 256 B of e2m1 pairs then 32 e4m3 scales
@@ -716,7 +722,10 @@ def test_v41_rope_insert_nvfp4_record(compress_ratio: int):
     torch.testing.assert_close(cache_backing, untouched, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(100),
+    reason="the 288 B NVFP4 KV record is SM100-only",
+)
 @pytest.mark.parametrize("num_reqs", [1, 8, 32])
 @pytest.mark.parametrize("num_tokens", [70, 128, 129, 2051])
 @pytest.mark.parametrize("partial", [False, True])
@@ -1715,7 +1724,9 @@ def test_get_c128_boundary(starts, query_start_loc, expected):
     assert _get_c128_boundary(metadata) is expected
 
 
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+@pytest.mark.skipif(
+    not has_cutedsl_fp8(), reason="asserts the CuTeDSL compressor launch"
+)
 @torch.inference_mode()
 def test_c128_skip_is_not_baked_into_cuda_graph(monkeypatch):
     """A graph captured on a batch with no C128 boundary must still launch the
@@ -2546,6 +2557,10 @@ def test_fused_kv_insert_indexer(
                 )
 
 
+@pytest.mark.skipif(
+    not has_cutedsl_fp8(),
+    reason="CuTeDSL FP8 kernels lower to sm89+ instructions",
+)
 @pytest.mark.parametrize("compress_ratio", [4, 128])
 @pytest.mark.parametrize("store_fp8", [False, True])
 def test_cutedsl_full_cache_store(compress_ratio: int, store_fp8: bool):

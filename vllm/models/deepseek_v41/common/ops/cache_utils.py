@@ -40,6 +40,12 @@ from vllm.v1.attention.ops.fp8_e4m3_portable import (
     float_to_e4m3_bytes,
     has_native_fp8e4nv,
 )
+from vllm.v1.attention.ops.fp8e4nv import FP8E4NV_EXTERN_LIBS
+
+
+def _fp8_extern_libs() -> dict:
+    """Link the E4M3 bitcode on targets without native FP8 conversion."""
+    return {} if has_native_fp8e4nv() else {"extern_libs": FP8E4NV_EXTERN_LIBS}
 
 # Per-token byte width of the paged records; ``k_cache.shape[-1]`` -- the
 # width the KV-cache spec publishes -- identifies the record:
@@ -291,6 +297,7 @@ def quantize_and_insert_k_cache(
             else torch.finfo(torch.float8_e4m3fn).max,
             use_fnuz=use_fnuz,
             NATIVE_FP8=has_native_fp8e4nv(),
+            **_fp8_extern_libs(),
         )
         return
 
@@ -325,6 +332,7 @@ def quantize_and_insert_k_cache(
         n_quant_blocks=8,
         use_fnuz=use_fnuz,
         NATIVE_FP8=has_native_fp8e4nv(),
+        **_fp8_extern_libs(),
     )
 
 
@@ -734,6 +742,7 @@ def dequantize_and_gather_k_cache_triton(
             block_stride=k_cache.stride(0),
             use_fnuz=use_fnuz,
             portable_fp8=portable_fp8,
+            **_fp8_extern_libs(),
         )
         return
 
@@ -749,6 +758,13 @@ def dequantize_and_gather_k_cache_triton(
         _dequantize_and_gather_k_one_pass_kernel
         if current_platform.is_rocm()
         else _dequantize_and_gather_k_kernel
+    )
+    # Only the OCP kernel carries the portable-FP8 switch (the ROCm one-pass
+    # kernel is FNUZ-only and never sees E4M3 bytes).
+    fp8_kwargs = (
+        {"portable_fp8": portable_fp8, **_fp8_extern_libs()}
+        if kernel is _dequantize_and_gather_k_kernel
+        else {}
     )
     kernel[(num_reqs, gather_workers)](
         out,
@@ -771,7 +787,7 @@ def dequantize_and_gather_k_cache_triton(
         fp8_max=FP8_MAX,
         n_quant_blocks=7,
         use_fnuz=use_fnuz,
-        portable_fp8=portable_fp8,
+        **fp8_kwargs,
     )
 
 

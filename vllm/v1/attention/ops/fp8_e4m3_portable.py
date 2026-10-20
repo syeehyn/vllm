@@ -11,24 +11,17 @@ conversions to and from it, but any use at all, including ``bitcast=True``::
 That blocks every DeepSeek-V4/V4.1 FP8 KV-cache kernel on Ampere, since the
 cache records are OCP E4M3 bytes.
 
-``fp8e4b15`` *is* accepted, and it differs from OCP E4M3 only in exponent bias
-(15 vs 7).  Reinterpreting E4M3 bits as e4b15 therefore yields exactly the right
-value scaled by ``2**-8``, for normals and subnormals alike -- so a single
-multiply by 256 recovers it.  Encoding is the same identity run backwards.
+``fp8e4b15`` *is* accepted.  Two implementations are possible:
 
-Accuracy (measured against ``torch`` on sm_80, see
-``tests/kernels/attention/test_fp8_e4m3_portable.py``):
+* a pure-Triton bias shift (reinterpret as ``e4b15``, scale by ``2**-8``), which
+  is bit-exact for decoding but rounds *ties away from zero* when encoding;
+* the packaged ``fp8e4nv`` bitcode (``vllm.v1.attention.ops.fp8e4nv``), hand
+  written PTX that re-targets to any arch and performs saturating RNE.
 
-* ``e4m3_bytes_to_float`` is **bit-exact** on all 254 finite E4M3 byte patterns.
-  Only 0x7F/0xFF -- E4M3's NaNs -- differ, and no well-formed cache encoder
-  emits them.
-* ``float_to_e4m3_bytes`` agrees with ``Tensor.to(torch.float8_e4m3fn)`` on
-  every non-tie value, on over-range saturation, on subnormals and on negatives.
-  It differs on **exact ties**, where it rounds half away from zero while IEEE
-  rounds half to even (126 of the 252 midpoints between adjacent finite E4M3
-  values), and it saturates NaN to 448 instead of propagating NaN.  Both are
-  sub-ULP for KV-cache quantization, but callers that need strict RNE should not
-  use this path.
+This module uses the bitcode, so encoding is bit-identical to native
+``Tensor.to(torch.float8_e4m3fn)``.  Kernels that inline it must pass
+``extern_libs=FP8E4NV_EXTERN_LIBS`` at launch on machines without native FP8
+support (``has_native_fp8e4nv()`` is False).
 
 On sm_89 and newer the native ``fp8e4nv`` conversions are used instead, so these
 helpers are safe to call unconditionally.
@@ -38,6 +31,11 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.fp8e4nv import (
+    FP8E4NV_EXTERN_LIBS,
+    convert_from_fp8e4m3,
+    convert_to_fp8e4m3,
+)
 
 
 def has_native_fp8e4nv() -> bool:
@@ -58,8 +56,8 @@ def e4m3_bytes_to_float(x_u8, NATIVE_FP8: tl.constexpr):
     """
     if NATIVE_FP8:
         return x_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
-    # E4M3 bias is 7, e4b15's is 15, so the reinterpreted bits read 2**-8 low.
-    return x_u8.to(tl.float8e4b15, bitcast=True).to(tl.float32) * 256.0
+    # Saturating RNE through the packaged E4M3 bitcode; exact for every byte.
+    return convert_from_fp8e4m3(x_u8, tl.float32)
 
 
 @triton.jit
@@ -71,8 +69,8 @@ def float_to_e4m3_bytes(x, NATIVE_FP8: tl.constexpr):
     """
     if NATIVE_FP8:
         return x.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
-    # 0.00390625 == 2**-8, undoing the bias difference before the cast.
-    return (x * 0.00390625).to(tl.float8e4b15).to(tl.uint8, bitcast=True)
+    # Saturating RNE through the packaged E4M3 bitcode; matches native exactly.
+    return convert_to_fp8e4m3(x)
 
 
 # ---------------------------------------------------------------------------
@@ -105,8 +103,14 @@ def e4m3_to_float(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty(x.shape, dtype=torch.float32, device=x.device)
     n = x.numel()
     BLOCK = 1024
+    native = has_native_fp8e4nv()
     _decode_kernel[(triton.cdiv(n, BLOCK),)](
-        x, out, n, NATIVE_FP8=has_native_fp8e4nv(), BLOCK=BLOCK
+        x,
+        out,
+        n,
+        NATIVE_FP8=native,
+        BLOCK=BLOCK,
+        **({} if native else {"extern_libs": FP8E4NV_EXTERN_LIBS}),
     )
     return out
 
@@ -117,7 +121,13 @@ def float_to_e4m3(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty(x.shape, dtype=torch.uint8, device=x.device)
     n = x.numel()
     BLOCK = 1024
+    native = has_native_fp8e4nv()
     _encode_kernel[(triton.cdiv(n, BLOCK),)](
-        x, out, n, NATIVE_FP8=has_native_fp8e4nv(), BLOCK=BLOCK
+        x,
+        out,
+        n,
+        NATIVE_FP8=native,
+        BLOCK=BLOCK,
+        **({} if native else {"extern_libs": FP8E4NV_EXTERN_LIBS}),
     )
     return out.view(torch.float8_e4m3fn)

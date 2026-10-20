@@ -81,6 +81,7 @@ from vllm.v1.attention.ops.fp8_e4m3_portable import (
     e4m3_bytes_to_float,
     has_native_fp8e4nv,
 )
+from vllm.v1.attention.ops.fp8e4nv import FP8E4NV_EXTERN_LIBS
 
 logger = init_logger(__name__)
 
@@ -1183,6 +1184,7 @@ class ParallelEngramEmbedding(nn.Module):
             PACKED=out.dtype == torch.uint8,
             OUT_STRIDE=out.stride(0),
             PORTABLE_FP8=portable_fp8,
+            **({} if not portable_fp8 else {"extern_libs": FP8E4NV_EXTERN_LIBS}),
         )
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:

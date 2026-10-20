@@ -685,6 +685,7 @@ def fp8_fp4_mqa_logits(
             cu_seqlen_ks,
             cu_seqlen_ke,
             clean_logits=clean_logits,
+            max_seqlen_k=max_seqlen_k,
         )
     _lazy_init()
     if _fp8_fp4_mqa_logits_impl is None:

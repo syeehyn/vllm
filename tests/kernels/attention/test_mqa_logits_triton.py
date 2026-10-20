@@ -202,6 +202,54 @@ def test_fp8_mqa_logits_triton_matches_torch(
         )
 
 
+@pytest.mark.parametrize("M,N", [(64, 256), (128, 512)])
+@pytest.mark.parametrize("num_heads", [16, 32])
+def test_fp8_mqa_logits_triton_row_local_layout(M, N, num_heads):
+    """`max_seqlen_k` reproduces DeepGEMM's row-local contract.
+
+    The indexer's top-k and candidate selection expect column `j` of row `m`
+    to be K position `ks[m] + j` with the row right-aligned to zero, which is
+    what DeepGEMM emits and what chunked prefill needs when requests start at
+    different offsets.
+    """
+    torch.manual_seed(0)
+    head_dim = 128
+    device = "cuda"
+
+    q_bf16 = torch.randn(M, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k_bf16 = torch.randn(N, head_dim, dtype=torch.bfloat16, device=device)
+    weights = torch.randn(M, num_heads, dtype=torch.float32, device=device)
+    q_fp8 = q_bf16.to(torch.float8_e4m3fn)
+    k_fp8, k_scales = _quantize_k_per_row(k_bf16)
+
+    ks = torch.arange(M, dtype=torch.int32, device=device) % (N // 4)
+    ke = ks + torch.randint(1, N // 2, (M,), dtype=torch.int32, device=device)
+    ke = torch.minimum(ke, torch.tensor(N, dtype=torch.int32, device=device))
+    width = int((ke - ks).max().item())
+
+    abs_ref = _fp8_mqa_logits_ref(q_fp8, (k_fp8, k_scales), weights, ks, ke)
+    expected = torch.full(
+        (M, width), float("-inf"), dtype=torch.float32, device=device
+    )
+    for m in range(M):
+        start, end = int(ks[m].item()), int(ke[m].item())
+        expected[m, : end - start] = abs_ref[m, start:end]
+
+    out = fp8_mqa_logits_triton(
+        q_fp8,
+        (k_fp8, k_scales),
+        weights,
+        ks,
+        ke,
+        clean_logits=True,
+        max_seqlen_k=width,
+    )
+    assert out.shape == (M, width)
+    assert torch.equal(torch.isinf(out) & (out < 0), torch.isinf(expected) & (expected < 0))
+    finite = ~torch.isinf(expected)
+    torch.testing.assert_close(out[finite], expected[finite], atol=_ATOL, rtol=_RTOL)
+
+
 def test_fp8_mqa_logits_triton_clean_logits_false_overwrites_masked():
     """Regression test for PR #38476 comment 4398225404: when `clean_logits=False`
     skips the `-inf` pre-fill, the kernel itself must still write `-inf` to

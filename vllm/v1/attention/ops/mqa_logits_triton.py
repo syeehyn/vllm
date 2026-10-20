@@ -302,6 +302,8 @@ def _fp8_mqa_logits_kernel(
     stride_w_h,
     stride_l_m,
     stride_l_n,
+    OUT_WIDTH,
+    ROW_LOCAL: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     N,
@@ -324,13 +326,16 @@ def _fp8_mqa_logits_kernel(
     ks = tl.load(ks_ptr + m)
     ke = tl.load(ke_ptr + m)
     if (n_start >= ke) | (n_start + BLOCK_N <= ks):
-        # When `clean_logits=False` the caller skipped the -inf pre-fill, so
-        # write -inf here for the early-exit tile.
-        tl.store(
-            logits_ptr + m * stride_l_m + offs_n * stride_l_n,
-            tl.full([BLOCK_N], float("-inf"), dtype=tl.float32),
-            mask=mask_n,
-        )
+        if not ROW_LOCAL:
+            # When `clean_logits=False` the caller skipped the -inf pre-fill, so
+            # write -inf here for the early-exit tile.
+            tl.store(
+                logits_ptr + m * stride_l_m + offs_n * stride_l_n,
+                tl.full([BLOCK_N], float("-inf"), dtype=tl.float32),
+                mask=mask_n,
+            )
+        # Row-local output has no column for this tile: the -inf pre-fill (or
+        # the top-k bounds) already covers it.
         return
 
     offs_h = tl.arange(0, BLOCK_H)
@@ -366,10 +371,15 @@ def _fp8_mqa_logits_kernel(
     valid = mask_n & (offs_n >= ks) & (offs_n < ke)
     out = tl.where(valid, out, float("-inf"))
 
+    # ROW_LOCAL reproduces DeepGEMM's contract: column j of row m holds K
+    # position ks + j, so rows are right-aligned to zero and the caller can
+    # top-k over [0, ke - ks). The absolute form writes column offs_n.
+    col = offs_n - ks if ROW_LOCAL else offs_n
+    store_mask = mask_n & (col >= 0) & (col < OUT_WIDTH) if ROW_LOCAL else mask_n
     tl.store(
-        logits_ptr + m * stride_l_m + offs_n * stride_l_n,
+        logits_ptr + m * stride_l_m + col * stride_l_n,
         out,
-        mask=mask_n,
+        mask=store_mask,
     )
 
 
@@ -380,6 +390,7 @@ def fp8_mqa_logits_triton(
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
     clean_logits: bool = True,
+    max_seqlen_k: int | None = None,
 ) -> torch.Tensor:
     """Triton implementation of DeepGEMM's fp8_mqa_logits.
 
@@ -391,9 +402,12 @@ def fp8_mqa_logits_triton(
         cu_seqlen_ke: [M] int32
         clean_logits: when False, skip the -inf pre-fill of the output
             (indexer top-k reads only `[ks, ke)` per row). Matches DeepGEMM.
+        max_seqlen_k: when given, emit DeepGEMM's row-local layout of width
+            ``max_seqlen_k`` (column ``j`` of row ``m`` is K position
+            ``ks[m] + j``) instead of the absolute ``[M, N]`` layout.
 
     Returns:
-        logits:       [M, N] float32
+        logits:       [M, N] or [M, max_seqlen_k] float32
 
     """
     k_fp8, k_scales = kv
@@ -403,11 +417,15 @@ def fp8_mqa_logits_triton(
 
     M, num_heads, head_dim = q.shape
     N = k_fp8.shape[0]
+    row_local = max_seqlen_k is not None
+    out_width = max_seqlen_k if row_local else N
 
     if clean_logits:
-        logits = torch.full((M, N), float("-inf"), dtype=torch.float32, device=q.device)
+        logits = torch.full(
+            (M, out_width), float("-inf"), dtype=torch.float32, device=q.device
+        )
     else:
-        logits = torch.empty((M, N), dtype=torch.float32, device=q.device)
+        logits = torch.empty((M, out_width), dtype=torch.float32, device=q.device)
 
     BLOCK_H = max(16, triton.next_power_of_2(num_heads))
     BLOCK_D = triton.next_power_of_2(head_dim)
@@ -435,6 +453,8 @@ def fp8_mqa_logits_triton(
         weights.stride(1),
         logits.stride(0),
         logits.stride(1),
+        OUT_WIDTH=out_width,
+        ROW_LOCAL=row_local,
         num_heads=num_heads,
         head_dim=head_dim,
         N=N,
