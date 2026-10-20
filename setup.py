@@ -1568,11 +1568,38 @@ SKIP_FLASH_ATTN = "VLLM_SKIP_FLASH_ATTN" in os.environ
 # their CMake targets are not configured (see CMakeLists.txt), so they must
 # not be listed as extensions either.
 MINIMAL_SM80_BUILD = "VLLM_SM80_MINIMAL_BUILD" in os.environ
+
+
+def _build_targets_sm90() -> bool:
+    """Whether this build targets SM90.
+
+    FA3 is Hopper-only. When the arch list has no 9.0 the FA3 CMake target ends
+    up with no per-file gencode flags, and building it for an SM80-only target
+    list fails with Hopper intrinsics errors. Skip it in that case.
+    """
+    arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST", "")
+    if arch_list:
+        archs = [
+            a.strip().replace("+PTX", "")
+            for entry in arch_list.split(";")
+            for a in entry.split()
+        ]
+        return any(a in ("9.0", "9.0a") for a in archs)
+    try:
+        import torch
+
+        return torch.cuda.get_device_capability()[0] == 9
+    except Exception:
+        return True
+
+
+TARGETS_SM90 = _build_targets_sm90()
 if _is_cuda():
     if not SKIP_FLASH_ATTN:
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
-        if USE_PRECOMPILED_EXTENSIONS or (
-            CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
+        if TARGETS_SM90 and (
+            USE_PRECOMPILED_EXTENSIONS
+            or (CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3"))
         ):
             # FA3 requires CUDA 12.3 or later
             ext_modules.append(
