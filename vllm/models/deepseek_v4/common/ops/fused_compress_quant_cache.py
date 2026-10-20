@@ -36,6 +36,10 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
 from vllm.utils.math_utils import round_up
 from vllm.v1.attention.ops.common import pack_ue8m0_x4
+from vllm.v1.attention.ops.fp8e4nv import (
+    FP8E4NV_EXTERN_LIBS,
+    convert_to_fp8e4m3,
+)
 
 if current_platform.is_rocm():
     from vllm.platforms.rocm import _ON_GFX950
@@ -74,10 +78,21 @@ def compress_norm_rope_store_triton(
     Picks one of the three kernels in this module based on ``head_dim`` and
     ``use_fp4_cache``. Identical launch signature for all three.
     """
+    fp8_software_conv = (
+        current_platform.is_cuda()
+        and current_platform.has_device_capability(75)
+        and not current_platform.has_device_capability(89)
+    )
     if head_dim == 512:
         kernel = _fused_kv_compress_norm_rope_insert_sparse_attn
         num_warps = 4
-        kernel_kwargs = {"SANITIZE_CACHE_NANS": _ON_GFX950}
+        kernel_kwargs = {
+            "SANITIZE_CACHE_NANS": _ON_GFX950,
+            "FP8_SOFTWARE_CONV": fp8_software_conv,
+        }
+        launch_kwargs = (
+            {"extern_libs": FP8E4NV_EXTERN_LIBS} if fp8_software_conv else {}
+        )
     else:
         _FUSED_KV_COMPRESS_NORM_ROPE_INSERT_INDEXER_TRITON_KERNEL(
             state_cache=state_cache,
@@ -102,6 +117,7 @@ def compress_norm_rope_store_triton(
             quant_block=quant_block,
             token_stride=token_stride,
             scale_dim=scale_dim,
+            fp8_software_conv=fp8_software_conv,
         )
         return
 
@@ -142,6 +158,7 @@ def compress_norm_rope_store_triton(
         num_warps=num_warps,
         **kernel_kwargs,
         **pdl_kwargs,
+        **launch_kwargs,
     )
 
 
@@ -184,6 +201,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     SCALE_DIM: tl.constexpr,  # 8 for DeepseekV4 (7 real + 1 pad)
     KV_BLOCK_STRIDE: tl.constexpr,
     SANITIZE_CACHE_NANS: tl.constexpr,
+    FP8_SOFTWARE_CONV: tl.constexpr,
 ):
     """Fused compress → RMSNorm → FP8 quant (nope) → RoPE → bf16 store (rope).
 
@@ -291,8 +309,11 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     inv_scales_col = tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
     x_scaled = quant_2d * inv_scales_col
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    x_fp8 = x_clamped.to(tl.float8e4nv)
-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+    if FP8_SOFTWARE_CONV:
+        x_uint8 = convert_to_fp8e4m3(x_clamped)
+    else:
+        x_fp8 = x_clamped.to(tl.float8e4nv)
+        x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
     x_uint8_flat = tl.reshape(x_uint8, (TRITON_BLOCK_SIZE,))
 
     nope_mask = block < NOPE_HEAD_DIM
@@ -460,6 +481,7 @@ def _finalize_norm_rope_quant_store_sparse_attn(
     SCALE_DIM: tl.constexpr,
     KV_BLOCK_STRIDE: tl.constexpr,
     SANITIZE_CACHE_NANS: tl.constexpr,
+    FP8_SOFTWARE_CONV: tl.constexpr,
 ):
     """Stage 2: read compressed_kv[512] from scratch buffer, then
     RMSNorm + FP8 quant (nope) + RoPE + bf16 store
@@ -510,10 +532,11 @@ def _finalize_norm_rope_quant_store_sparse_attn(
     inv_scales = tl.exp2(-exponents)
     x_scaled = quant_2d * tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    x_uint8 = tl.reshape(
-        x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True),
-        (TRITON_BLOCK_SIZE,),
-    )
+    if FP8_SOFTWARE_CONV:
+        x_uint8 = convert_to_fp8e4m3(x_clamped)
+    else:
+        x_uint8 = x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+    x_uint8 = tl.reshape(x_uint8, (TRITON_BLOCK_SIZE,))
     tl.store(fp8_ptr + block, x_uint8, mask=block < NOPE_HEAD_DIM)
 
     scale_idx = tl.arange(0, N_QUANT_BLOCKS)
@@ -568,6 +591,12 @@ def _launch_two_stage_sparse_attn_compressor(
     num_actual: int,
     compress_scratch: torch.Tensor,
 ) -> None:
+    """Compress states first, then normalize, rotate, quantize, and insert keys."""
+    fp8_software_conv = (
+        current_platform.is_cuda()
+        and current_platform.has_device_capability(75)
+        and not current_platform.has_device_capability(89)
+    )
     num_splits = _pick_compress_num_splits(num_actual, compress_ratio, head_dim)
     head_tile = head_dim // num_splits
     scratch = compress_scratch[:num_actual]
@@ -611,6 +640,8 @@ def _launch_two_stage_sparse_attn_compressor(
         SCALE_DIM=scale_dim,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
         SANITIZE_CACHE_NANS=_ON_GFX950,
+        FP8_SOFTWARE_CONV=fp8_software_conv,
+        **({"extern_libs": FP8E4NV_EXTERN_LIBS} if fp8_software_conv else {}),
     )
 
 
@@ -745,6 +776,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     SCALE_DIM: tl.constexpr,  # 4 for indexer (1 float32)
     KV_BLOCK_STRIDE: tl.constexpr,
     MX_SCALE: tl.constexpr,  # store the scale as 4 packed UE8M0 bytes
+    FP8_SOFTWARE_CONV: tl.constexpr,
 ):
     """Fused compress → RMSNorm → RoPE → FP8 quant → store.
 
@@ -874,8 +906,10 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
 
     x_scaled = result_bf16 * inv_scale
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    x_fp8 = x_clamped.to(tl.float8e4nv)
-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+    if FP8_SOFTWARE_CONV:
+        x_uint8 = convert_to_fp8e4m3(x_clamped)
+    else:
+        x_uint8 = x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
 
     tl.store(fp8_ptr + block, x_uint8, mask=mask)
 
@@ -1110,6 +1144,7 @@ class FusedKVCompressNormRopeInsertIndexerTritonKernel(
         kv_cache_block_size: int
         kv_block_stride: int
         mx_scale: bool
+        fp8_software_conv: bool
 
     # Canonical kernel for the launcher's arg_names mapping; the launched
     # variant (fp8/mxfp4, same arg_names) is picked per call in __call__.
@@ -1131,6 +1166,7 @@ class FusedKVCompressNormRopeInsertIndexerTritonKernel(
         runtime_scale_dim: int | None = None,
         runtime_kv_block_stride: int | None = None,
     ) -> CompileKey:
+        """Specialize compression for the cache layout and runtime state width."""
         overlap = compress_ratio == 4
         default_quant_block = 32 if use_fp4_cache else 128
         quant_block = (
@@ -1190,6 +1226,12 @@ class FusedKVCompressNormRopeInsertIndexerTritonKernel(
             kv_cache_block_size=kv_cache_block_size,
             kv_block_stride=kv_block_stride,
             mx_scale=not use_fp4_cache and mqa_logits_use_mx_scales(),
+            fp8_software_conv=(
+                current_platform.is_cuda()
+                and current_platform.has_device_capability(75)
+                and not current_platform.has_device_capability(89)
+                and not use_fp4_cache
+            ),
         )
 
     def get_warmup_keys(self, vllm_config: Any) -> list[CompileKey]:
@@ -1221,6 +1263,7 @@ class FusedKVCompressNormRopeInsertIndexerTritonKernel(
         )
 
     def warmup_inputs(self, compile_key: CompileKey) -> dict[str, Any]:
+        """Construct synthetic compressor inputs with the specialized cache strides."""
         fp32_ptr = TritonWarmupTensor(torch.float32, shape=(1, 1))
         int32_ptr = TritonWarmupTensor(torch.int32)
         int64_ptr = TritonWarmupTensor(torch.int64)
@@ -1257,6 +1300,7 @@ class FusedKVCompressNormRopeInsertIndexerTritonKernel(
             quant_block=compile_key.quant_block,
             token_stride=compile_key.token_stride,
             scale_dim=compile_key.scale_dim,
+            fp8_software_conv=compile_key.fp8_software_conv,
         )
 
     @kernel_launcher
@@ -1285,7 +1329,17 @@ class FusedKVCompressNormRopeInsertIndexerTritonKernel(
         quant_block: int,
         token_stride: int,
         scale_dim: int,
+        fp8_software_conv: bool,
     ) -> LaunchSpec:
+        """Build a fused compressor launch for the supplied state and cache tensors."""
+        fp8_kwargs = (
+            {}
+            if use_fp4_cache
+            else {
+                "FP8_SOFTWARE_CONV": fp8_software_conv,
+                **({"extern_libs": FP8E4NV_EXTERN_LIBS} if fp8_software_conv else {}),
+            }
+        )
         return (num_actual,), dict(
             kernel=(
                 _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn
@@ -1313,6 +1367,7 @@ class FusedKVCompressNormRopeInsertIndexerTritonKernel(
             MX_SCALE=not use_fp4_cache and mqa_logits_use_mx_scales(),
             num_warps=1,
             **pdl_kwargs,
+            **fp8_kwargs,
         )
 
 
