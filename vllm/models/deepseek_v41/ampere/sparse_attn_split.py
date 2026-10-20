@@ -82,23 +82,19 @@ def _split_kernel(
             other=-1,
         )
         mask_kv = (idx >= 0) & (idx < seq_kv)
-        k = tl.load(
-            kv_ptr + idx[None, :] * stride_kv_token + offs_d[:, None],
-            mask=mask_kv[None, :],
-            other=0.0,
-        )
-        qk = tl.dot(q, k.to(q.dtype)) * sm_scale
-        qk = tl.where(mask_h[:, None] & mask_kv[None, :], qk, -1.0e30)
-
-        v = tl.load(
+        # MLA latents are both key and value, so one [N, D] tile feeds both dots.
+        kv_tile = tl.load(
             kv_ptr + idx[:, None] * stride_kv_token + offs_d[None, :],
             mask=mask_kv[:, None],
             other=0.0,
         )
+        qk = tl.dot(q, tl.trans(kv_tile)) * sm_scale
+        qk = tl.where(mask_h[:, None] & mask_kv[None, :], qk, -1.0e30)
+
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
         rescale = tl.exp2(e_max - n_e_max)
         p = tl.exp2(qk - n_e_max[:, None])
-        acc = acc * rescale[:, None] + tl.dot(p.to(v.dtype), v)
+        acc = acc * rescale[:, None] + tl.dot(p.to(kv_tile.dtype), kv_tile)
         e_sum = e_sum * rescale + tl.sum(p, 1)
         e_max = n_e_max
 
@@ -196,7 +192,8 @@ def ampere_sparse_attn_split(
     topk = indices.shape[-1]
     assert kv.shape[-1] == dim, "q and kv head dims must match"
 
-    h_blocks = triton.cdiv(h_q, _BLOCK_H)
+    block_h = min(_BLOCK_H, h_q)
+    h_blocks = triton.cdiv(h_q, block_h)
     n_splits = _choose_splits(num_tokens, h_blocks, topk)
     per_split = triton.cdiv(triton.cdiv(topk, _BLOCK_N), n_splits) * _BLOCK_N
 
@@ -230,7 +227,7 @@ def ampere_sparse_attn_split(
         sm_scale * LOG2E,
         index_topk=topk,
         per_split=per_split,
-        BLOCK_H=_BLOCK_H,
+        BLOCK_H=block_h,
         BLOCK_N=_BLOCK_N,
         BLOCK_D=dim,
         num_warps=4,
