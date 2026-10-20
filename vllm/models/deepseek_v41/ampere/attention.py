@@ -32,19 +32,30 @@ class DeepseekV4AmpereAttention(DeepseekV4FlashMLAAttention):
         self._einsum_recipe = None
         self._tma_aligned_scales = False
 
-    def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def _o_proj(
+        self, attn_out: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        # `_alloc_attn_out` hands over the whole padded buffer; drop the
+        # padding heads before the inverse RoPE expects n_local_heads.
+        o = attn_out[:, : self.n_local_heads]
         return ampere_bf16_o_proj(
             o,
             positions,
             self.rotary_emb.cos_sin_cache,
             self.wo_a,
-            self.wo_b,
+            self._wo_b_proj,
             n_groups=self.n_local_groups,
             heads_per_group=self.n_local_heads // self.n_local_groups,
             nope_dim=self.nope_head_dim,
             rope_dim=self.rope_head_dim,
             o_lora_rank=self.o_lora_rank,
         )
+
+    @classmethod
+    def get_padded_num_q_heads(cls, num_heads: int) -> int:
+        # No FlashMLA FP8 decode constraint here: keep the natural head count
+        # so a TP8 rank does not run the sparse kernels at 64 padded heads.
+        return num_heads
 
     def _sparse_attn_fwd(
         self,

@@ -197,6 +197,12 @@ class DeepseekV4MoE(DeepseekV4MoEBase):
         return MoEOutput(routed=routed, shared_output=shared_output)
 
 
+def _ampere_attn_cls() -> type[DeepseekV4Attention]:
+    from vllm.models.deepseek_v41.ampere.attention import DeepseekV4AmpereAttention
+
+    return DeepseekV4AmpereAttention
+
+
 def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     """Pick the CUDA sparse-MLA attention class for the configured backend.
 
@@ -242,6 +248,8 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
         AttentionBackendEnum.FLASHMLA_SPARSE_DSV4,
         AttentionBackendEnum.FLASHMLA_SPARSE_DSV41,
     ):
+        if device_capability is not None and device_capability.major == 8:
+            return _ampere_attn_cls()
         return DeepseekV4FlashMLAAttention
 
     if device_capability is not None and device_capability.major == 12:
@@ -249,11 +257,7 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     # Ampere (SM80/SM86) has no FlashMLA sparse kernel and no FP8 MMA; use the
     # portable BF16 Triton sparse-MLA path.
     if device_capability is not None and device_capability.major == 8:
-        from vllm.models.deepseek_v41.ampere.attention import (
-            DeepseekV4AmpereAttention,
-        )
-
-        return DeepseekV4AmpereAttention
+        return _ampere_attn_cls()
     # Mega attention is the SM100 default: it fuses Q RoPE, sparse attention,
     # the output's inverse RoPE and its FP8 cast into one launch, and brings
     # the 288 B NVFP4 compressed record -- the format the reference

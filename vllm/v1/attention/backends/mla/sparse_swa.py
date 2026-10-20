@@ -34,7 +34,11 @@ from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
+from vllm.v1.attention.ops.flashmla import (
+    FlashMLASchedMeta,
+    get_mla_metadata,
+    is_flashmla_sparse_supported,
+)
 from vllm.v1.attention.ops.metadata import compute_token_to_req_indices
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
@@ -934,6 +938,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             or current_platform.is_rocm()
             or current_platform.is_xpu()
             or current_platform.is_device_capability_family(120)
+            # No FlashMLA sparse kernel (e.g. Ampere): the tile scheduler has
+            # no consumer, and get_mla_metadata() would raise without the C ext.
+            or not is_flashmla_sparse_supported()[0]
         ):
             return out
         for layer_type in self._layer_types:

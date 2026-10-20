@@ -41,7 +41,12 @@ def _bf16_bmm_weight(wo_a: nn.Module, n_groups: int, o_lora_rank: int) -> torch.
         weight = dequant_mxfp8_to_bf16(
             weight.view(torch.float8_e4m3fn).contiguous(), scale.data
         )
-    weight = weight.to(torch.bfloat16).view(n_groups, o_lora_rank, -1).contiguous()
+    # Packed (Marlin-style) weights carry a storage width, not the logical
+    # projection width; prefer the module's declared input size.
+    in_dim = getattr(wo_a, "input_size", None) or weight.shape[-1] // n_groups
+    weight = (
+        weight.to(torch.bfloat16).view(n_groups, o_lora_rank, in_dim).contiguous()
+    )
 
     wo_a._ampere_bf16_weight = weight
     return weight

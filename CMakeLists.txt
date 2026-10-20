@@ -1586,14 +1586,26 @@ endif()
 
 # For CUDA we also build and ship some external projects.
 if (VLLM_GPU_LANG STREQUAL "CUDA")
-    include(cmake/external_projects/deepgemm.cmake)
-    include(cmake/external_projects/deepselect.cmake)
-    include(cmake/external_projects/fmha_sm100.cmake)
-    include(cmake/external_projects/flashmla.cmake)
-    include(cmake/external_projects/flashkda.cmake)
-    include(cmake/external_projects/qutlass.cmake)
-    include(cmake/external_projects/tml_fa4.cmake)
+    # VLLM_SM80_MINIMAL_BUILD=1 skips the SM90/SM100 external projects for a
+    # text-only SM80 build; their git submodules are large and unused here.
+    if(NOT DEFINED ENV{VLLM_SM80_MINIMAL_BUILD})
+      include(cmake/external_projects/deepgemm.cmake)
+      include(cmake/external_projects/deepselect.cmake)
+      include(cmake/external_projects/fmha_sm100.cmake)
+      include(cmake/external_projects/flashmla.cmake)
+      include(cmake/external_projects/flashkda.cmake)
+      include(cmake/external_projects/qutlass.cmake)
+      include(cmake/external_projects/tml_fa4.cmake)
+    else()
+      message(STATUS "Skipping SM90/SM100 external projects (VLLM_SM80_MINIMAL_BUILD set)")
+    endif()
 
-    # vllm-flash-attn should be last as it overwrites some CMake functions
-    include(cmake/external_projects/vllm_flash_attn.cmake)
+    # vllm-flash-attn should be last as it overwrites some CMake functions.
+    # VLLM_SKIP_FLASH_ATTN=1 builds without FA2/FA3 (its git submodules are
+    # large; text-only SM80 bring-up does not need them).
+    if(NOT DEFINED ENV{VLLM_SKIP_FLASH_ATTN})
+      include(cmake/external_projects/vllm_flash_attn.cmake)
+    else()
+      message(STATUS "Skipping vllm-flash-attn (VLLM_SKIP_FLASH_ATTN set)")
+    endif()
 endif ()
