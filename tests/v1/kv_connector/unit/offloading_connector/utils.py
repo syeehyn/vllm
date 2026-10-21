@@ -351,7 +351,7 @@ class RequestRunner:
         self.gpu_blocks: dict[int, GPUBlock] = {}
 
         init_none_hash(sha256)
-        self._block_hasher = get_request_block_hasher(block_size, sha256)
+        self._block_hasher = get_request_block_hasher(hash_block_size, sha256)
 
         self._dummy_ctx: ForwardContext = ForwardContext(
             no_compile_layers={},

@@ -161,6 +161,10 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
             max_num_new_tokens=self._max_loadable_tokens(request, num_computed_tokens),
         )
 
+    def get_loaded_kv_cache_group_ids(self, request: "Request") -> tuple[int, ...]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_loaded_kv_cache_group_ids(request)
+
     def _max_loadable_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> int | None:

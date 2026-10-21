@@ -35,7 +35,13 @@ if TYPE_CHECKING:
 
 def get_offloading_group_ids(kv_cache_config: "KVCacheConfig") -> tuple[int, ...]:
     if kv_cache_config.hisparse_host_num_blocks is None:
-        return kv_cache_config.prefix_cacheable_group_ids
+        # Replay groups (DSV4.1 SWA bounded replay) are offloaded as well, so a
+        # prefix-cache hit can restore their window instead of replaying it.
+        return kv_cache_config.prefix_cacheable_group_ids + tuple(
+            group_id
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            if group.kv_cache_spec.prefix_replay_tokens > 0
+        )
     return tuple(
         group_id
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups)

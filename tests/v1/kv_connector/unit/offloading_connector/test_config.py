@@ -18,7 +18,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
 )
 from vllm.platforms import current_platform
 from vllm.v1.core.kv_cache_planning import kv_cache_groups_tp_replicas
-from vllm.v1.core.kv_cache_utils import generate_scheduler_kv_cache_config
+from vllm.v1.core.kv_cache_utils import (
+    generate_scheduler_kv_cache_config,
+    resolve_kv_cache_block_sizes,
+)
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -384,7 +387,9 @@ def _make_swa_mla_kv_cache_config(
     )
 
 
-def _make_dsv4_flash_kv_cache_config(num_blocks: int = 4) -> KVCacheConfig:
+def _make_dsv4_flash_kv_cache_config(
+    num_blocks: int = 4, bounded_replay: bool = False
+) -> KVCacheConfig:
     """Minimal fake of DeepSeek-V4-Flash's five UniformTypeKVCacheSpecs groups.
 
     The real model has the following groups (layer counts from runtime logs);
@@ -410,6 +415,7 @@ def _make_dsv4_flash_kv_cache_config(num_blocks: int = 4) -> KVCacheConfig:
             head_size=head_size,
             dtype=dtype,
             sliding_window=sw,
+            bounded_replay=bounded_replay,
         )
         return KVCacheGroupSpec(
             names,
@@ -457,6 +463,77 @@ def _make_dsv4_flash_kv_cache_config(num_blocks: int = 4) -> KVCacheConfig:
                 layer_stride=page * num_blocks,
                 block_stride=page,
             )
+        ],
+        kv_cache_groups=groups,
+    )
+
+
+def _make_dsv4_flash_replay_kv_cache_config(num_blocks: int = 4) -> KVCacheConfig:
+    """DSV4.1's production group block sizes, SWA bounded replay on.
+
+    Five groups, the shapes the model resolves at runtime (32/32/128/8/32):
+        group[0]: SlidingWindowMLASpec block 32, window 128, replayed
+        group[1]: SlidingWindowMLASpec block 32, window 128, replayed
+        group[2]: MLAAttentionSpec block 128 (prefix cacheable)
+        group[3]: SlidingWindowMLASpec block 8, window 8, replayed
+        group[4]: SlidingWindowMLASpec block 32, window 128, replayed
+    """
+    specs = [
+        SlidingWindowMLASpec(
+            block_size=32,
+            num_kv_heads=1,
+            max_tp_shards=1,
+            head_size=512,
+            dtype=torch.float32,
+            sliding_window=128,
+            bounded_replay=True,
+        ),
+        SlidingWindowMLASpec(
+            block_size=32,
+            num_kv_heads=1,
+            max_tp_shards=1,
+            head_size=512,
+            dtype=torch.float32,
+            sliding_window=128,
+            bounded_replay=True,
+        ),
+        MLAAttentionSpec(
+            block_size=128,
+            num_kv_heads=1,
+            max_tp_shards=1,
+            head_size=512,
+            dtype=torch.float32,
+        ),
+        SlidingWindowMLASpec(
+            block_size=8,
+            num_kv_heads=1,
+            max_tp_shards=1,
+            head_size=512,
+            dtype=torch.float32,
+            sliding_window=8,
+            bounded_replay=True,
+        ),
+        SlidingWindowMLASpec(
+            block_size=32,
+            num_kv_heads=1,
+            max_tp_shards=1,
+            head_size=512,
+            dtype=torch.float32,
+            sliding_window=128,
+            bounded_replay=True,
+        ),
+    ]
+    groups = [KVCacheGroupSpec([f"layer{i}"], spec) for i, spec in enumerate(specs)]
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=group.kv_cache_spec.page_size_bytes * num_blocks,
+                layers=list(group.layer_names),
+                layer_stride=group.kv_cache_spec.page_size_bytes * num_blocks,
+                block_stride=group.kv_cache_spec.page_size_bytes,
+            )
+            for group in groups
         ],
         kv_cache_groups=groups,
     )
@@ -752,6 +829,124 @@ def test_resolves_heterogeneous_hybrid_block_sizes():
     )
     assert offloading_config.cache.tokens_per_hash == 4
     assert offloading_config.cache.blocks_per_chunk == 1
+
+
+def test_replay_swa_groups_are_offloaded():
+    """A replayed SWA group holds its window in the CPU tier, so it is an
+    offloaded group even though it is not prefix cacheable."""
+    config = _make_vllm_config()
+    kv_cache_config = _make_dsv4_flash_kv_cache_config(bounded_replay=True)
+
+    offloading_config = build_offloading_config(config, kv_cache_config)
+
+    # All five groups are offloaded; without replay only the MLA group is.
+    # Cacheable groups come first, then the replayed ones.
+    assert tuple(group.group_id for group in offloading_config.groups) == (
+        2,
+        0,
+        1,
+        3,
+        4,
+    )
+    assert offloading_config.cache.tokens_per_hash == 16
+
+
+def test_replay_swa_groups_with_heterogeneous_block_sizes():
+    """Bounded replay at DSV4.1's production block sizes: the 8-token group
+    joins the hash granularity so every group's block size is divisible."""
+    config = _make_vllm_config()
+    kv_cache_config = _make_dsv4_flash_replay_kv_cache_config()
+
+    offloading_config = build_offloading_config(config, kv_cache_config)
+
+    assert {
+        group.group_id: group.tokens_per_block
+        for group in offloading_config.groups
+    } == {0: 32, 1: 32, 2: 128, 3: 8, 4: 32}
+    # gcd(32, 32, 128, 8, 32) = 8, where the cacheable-only view gives 128.
+    assert offloading_config.cache.tokens_per_hash == 8
+
+    spec = MockOffloadingSpec(offloading_config)
+    scheduler_config = SchedulerOffloadConfig.from_spec(spec, config, kv_cache_config)
+
+    assert {
+        group.group_idx: group.hashes_per_chunk
+        for group in scheduler_config.kv_group_configs
+    } == {0: 4, 1: 4, 2: 16, 3: 1, 4: 4}
+
+
+def test_retention_interval_does_not_constrain_replay_groups():
+    """Replay groups are always stored with sparse-retention (0) semantics, so
+    a retention interval that is not a multiple of their chunk size is fine."""
+    config = _make_vllm_config()
+    config.cache_config.prefix_cache_retention_interval = 1000
+    kv_cache_config = _make_dsv4_flash_replay_kv_cache_config()
+
+    offloading_config = build_offloading_config(config, kv_cache_config)
+    scheduler_config = SchedulerOffloadConfig.from_spec(
+        MockOffloadingSpec(offloading_config), config, kv_cache_config
+    )
+
+    assert scheduler_config.retention_interval == 1000
+    replay_chunk_sizes = {
+        group.tokens_per_chunk
+        for group in scheduler_config.kv_group_configs
+        if group.kv_cache_spec.prefix_replay_tokens > 0
+    }
+    assert replay_chunk_sizes == {8, 32}
+    assert any(1000 % chunk_size for chunk_size in replay_chunk_sizes)
+
+
+def test_retention_interval_still_constrains_cacheable_swa_groups():
+    config = _make_vllm_config()
+    config.cache_config.prefix_cache_retention_interval = 1000
+    kv_cache_config = _make_swa_mla_kv_cache_config()
+
+    offloading_config = build_offloading_config(config, kv_cache_config)
+    with pytest.raises(ValueError, match="must be a multiple"):
+        SchedulerOffloadConfig.from_spec(
+            MockOffloadingSpec(offloading_config), config, kv_cache_config
+        )
+
+
+def test_canonical_layout_disables_replication_for_bounded_replay():
+    """A replayed SWA-MLA group is not certifiable in canonical layout, so
+    replication stays off even though every group is TP-replicated."""
+    config = _make_vllm_config(
+        extra_config={"canonical_layout": True}, tensor_parallel_size=2
+    )
+    config.model_config.use_mla = True
+    kv_cache_config = _make_dsv4_flash_kv_cache_config(bounded_replay=True)
+    kv_cache_config.kv_tp_replicas = kv_cache_groups_tp_replicas(
+        kv_cache_config.kv_cache_groups,
+        config.parallel_config.tensor_parallel_size,
+        config.parallel_config.decode_context_parallel_size,
+    )
+
+    offloading_config = build_offloading_config(config, kv_cache_config)
+
+    assert not offloading_config.parallel.is_parallelism_agnostic
+    assert not offloading_config.replicated_layout
+
+
+def test_replay_groups_do_not_change_hashing_without_a_connector():
+    """Block hashing stays on the prefix-cacheable groups when no connector
+    would store the replayed window."""
+    config = _make_vllm_config()
+    kv_cache_config = _make_dsv4_flash_replay_kv_cache_config()
+
+    scheduler_block_size, tokens_per_hash = resolve_kv_cache_block_sizes(
+        kv_cache_config, config
+    )
+    assert scheduler_block_size == 128
+    assert tokens_per_hash == 8
+
+    config.kv_transfer_config = None
+    scheduler_block_size, tokens_per_hash = resolve_kv_cache_block_sizes(
+        kv_cache_config, config
+    )
+    assert scheduler_block_size == 128
+    assert tokens_per_hash == 128
 
 
 @pytest.mark.parametrize("world_size", [2, 4, 8])

@@ -882,10 +882,13 @@ def resolve_kv_cache_block_sizes(
     ):
         return scheduler_block_size, scheduler_block_size
 
+    # Replay groups (DSV4.1 SWA bounded replay) are hash-addressed by an
+    # offloading connector too: it stores their window so a hit can restore it.
     hashing_sizes = [
         block_size
         for group, block_size in zip(groups, group_block_sizes)
         if group.kv_cache_spec.prefix_cacheable
+        or (connector_enabled and group.kv_cache_spec.prefix_replay_tokens > 0)
     ] or group_block_sizes
     requested = cache_config.prefix_match_unit
     hash_block_size = requested if requested is not None else math.gcd(*hashing_sizes)

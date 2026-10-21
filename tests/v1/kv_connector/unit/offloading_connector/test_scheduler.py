@@ -58,6 +58,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
@@ -5088,3 +5090,710 @@ class TestMambaHybridOffloadServing:
             False,
         ]
         assert self._roundtrip_served_tokens(scheduler) == 16
+
+
+# ---------------------------------------------------------------------------
+# DSV4.1 SWA bounded replay: the replay group's window is stored and restored
+#
+# A replay group's hash-addressed entries hold no window: a prefix-cache hit
+# must load the hit's last `window` tokens to avoid recomputing them.
+# ---------------------------------------------------------------------------
+
+REPLAY_FULL_BLOCK = 64
+REPLAY_SWA_BLOCK = 32
+REPLAY_WINDOW = 128
+REPLAY_HASH = 8
+
+
+def _make_replay_groups() -> list[KVCacheGroupSpec]:
+    """Group 0 full attention (cacheable), group 1 replayed sliding window."""
+    return [
+        KVCacheGroupSpec(
+            ["layer0"],
+            FullAttentionSpec(
+                block_size=REPLAY_FULL_BLOCK,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer1"],
+            SlidingWindowMLASpec(
+                block_size=REPLAY_SWA_BLOCK,
+                num_kv_heads=1,
+                max_tp_shards=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=REPLAY_WINDOW,
+                bounded_replay=True,
+            ),
+        ),
+    ]
+
+
+def _make_replay_scheduler(
+    groups: list[KVCacheGroupSpec],
+) -> tuple[OffloadingConnectorScheduler, CPUOffloadingManager]:
+    manager = CPUOffloadingManager(num_chunks=200)
+    spec = SimpleNamespace(
+        config=SimpleNamespace(
+            groups=tuple(
+                SimpleNamespace(
+                    group_id=i, tokens_per_block=group.kv_cache_spec.block_size
+                )
+                for i, group in enumerate(groups)
+            )
+        ),
+        tokens_per_block=tuple(g.kv_cache_spec.block_size for g in groups),
+        tokens_per_hash=REPLAY_HASH,
+        blocks_per_chunk=1,
+        offload_prompt_only=True,
+        kv_events_config=OffloadingKVEventsConfig(
+            enable_kv_cache_events=False, self_describing_kv_events=False
+        ),
+        get_manager=lambda: manager,
+    )
+    config = SimpleNamespace(
+        speculative_config=None,
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=True, prefix_cache_retention_interval=None
+        ),
+        parallel_config=SimpleNamespace(world_size=1, decode_context_parallel_size=1),
+    )
+    scheduler = OffloadingConnectorScheduler(
+        spec,
+        config,
+        KVCacheConfig(num_blocks=256, kv_cache_tensors=[], kv_cache_groups=groups),
+    )
+    return scheduler, manager
+
+
+def _replay_request(num_tokens: int) -> MagicMock:
+    request = MagicMock()
+    request.request_id = "replay"
+    request.kv_transfer_params = None
+    request.num_tokens = request.num_prompt_tokens = num_tokens
+    request.shared_prefix_boundary = 0
+    request.block_hashes = [
+        BlockHash(f"h{i}".encode()) for i in range(num_tokens // REPLAY_HASH)
+    ]
+    request.skip_reading_prefix_cache = False
+    return request
+
+
+def _store_chunks(manager: CPUOffloadingManager, state, group_idx: int, chunk_idxs):
+    keys = [state.group_states[group_idx].offload_keys[i] for i in chunk_idxs]
+    if not keys:
+        return
+    store = manager.prepare_store(keys, state.req_context)
+    assert store is not None and not store.evicted_keys
+    manager.complete_store(store.keys_to_store, state.req_context)
+
+
+def _make_replay_managers(
+    groups: list[KVCacheGroupSpec], num_blocks: int = 128
+) -> list[SlidingWindowManager | FullAttentionManager]:
+    pool = BlockPool(num_blocks, enable_caching=True, hash_block_size=REPLAY_HASH)
+    managers = []
+    for group_id, group in enumerate(groups):
+        manager_cls = KVCacheSpecRegistry.get_manager_class(group.kv_cache_spec)
+        managers.append(
+            manager_cls(
+                kv_cache_spec=group.kv_cache_spec,
+                block_pool=pool,
+                enable_caching=True,
+                kv_cache_group_id=group_id,
+                scheduler_block_size=REPLAY_FULL_BLOCK * 2,
+                needs_kv_cache_zeroing=True,
+            )
+        )
+    return managers
+
+
+def _allocate_external(
+    managers: list[SlidingWindowManager | FullAttentionManager],
+    request_id: str,
+    num_local: int,
+    num_external: int,
+) -> None:
+    for manager in managers:
+        manager.add_local_computed_blocks(request_id, [], num_local, num_external)
+    for manager in managers:
+        manager.allocate_external_computed_blocks(request_id, num_local, num_external)
+
+
+def test_replay_group_window_is_restored_by_the_load():
+    """A hit whose window is fully present is reported as loaded, and the load
+    writes exactly the window blocks above the null head."""
+    groups = _make_replay_groups()
+    scheduler, manager = _make_replay_scheduler(groups)
+    # 1025 tokens: the connector recomputes the last prompt token, so the hit
+    # boundary is the chunk-aligned 1024.
+    total, local = 1025, 512
+    request = _replay_request(total)
+    scheduler.on_new_request(request)
+    state = scheduler._req_status[request.request_id]
+    state.update_offload_keys()
+    _store_chunks(manager, state, 0, range(total // REPLAY_FULL_BLOCK))
+    # Only the hit's window chunks are in the CPU tier for the replay group.
+    first_window_block = (total - REPLAY_WINDOW + 1) // REPLAY_SWA_BLOCK
+    _store_chunks(
+        manager, state, 1, range(first_window_block, total // REPLAY_SWA_BLOCK)
+    )
+
+    external, load_async = scheduler.get_num_new_matched_tokens(request, local)
+
+    assert external == 512  # 1024 - 512
+    assert load_async
+    # The full-attention group plus the replay group whose window is present.
+    assert scheduler.get_loaded_kv_cache_group_ids(request) == (0, 1)
+
+    managers = _make_replay_managers(groups)
+    # The reservation covers only the window, not the whole local range.
+    hit_boundary = local + external
+    assert managers[1].get_num_blocks_to_allocate(
+        request.request_id,
+        hit_boundary,
+        [],
+        hit_boundary,
+        local,
+        hit_boundary,
+    ) == hit_boundary // REPLAY_SWA_BLOCK - first_window_block
+    _allocate_external(managers, request.request_id, local, external)
+    swa_blocks = managers[1].req_to_blocks[request.request_id]
+    assert len(swa_blocks) == total // REPLAY_SWA_BLOCK
+    assert all(block.is_null for block in swa_blocks[:first_window_block])
+    assert not any(block.is_null for block in swa_blocks[first_window_block:])
+    # Only the window blocks were allocated for the external tokens.
+    assert managers[1].new_block_ids == [
+        block.block_id for block in swa_blocks[first_window_block:]
+    ]
+
+    blocks = KVCacheBlocks(
+        tuple(manager.req_to_blocks[request.request_id] for manager in managers)
+    )
+    scheduler.update_state_after_alloc(request, blocks, external)
+
+    load_job = next(iter(scheduler._current_batch_load_jobs.values()))
+    dst = load_job.dst_spec
+    assert isinstance(dst, GPULoadStoreSpec)
+    assert dst.group_sizes == [
+        total // REPLAY_FULL_BLOCK - local // REPLAY_FULL_BLOCK,
+        total // REPLAY_SWA_BLOCK - first_window_block,
+    ]
+    assert dst.block_indices == [local // REPLAY_FULL_BLOCK, first_window_block]
+    assert dst.block_ids[-dst.group_sizes[1] :].tolist() == [
+        block.block_id for block in swa_blocks[first_window_block:]
+    ]
+
+
+def _allocate_and_build(
+    groups: list[KVCacheGroupSpec], request_id: str, num_local: int, num_external: int
+) -> tuple[list[SlidingWindowManager | FullAttentionManager], KVCacheBlocks]:
+    managers = _make_replay_managers(groups)
+    _allocate_external(managers, request_id, num_local, num_external)
+    blocks = KVCacheBlocks(tuple(m.req_to_blocks[request_id] for m in managers))
+    return managers, blocks
+
+
+def _load_dst(scheduler: OffloadingConnectorScheduler) -> GPULoadStoreSpec:
+    dst = next(iter(scheduler._current_batch_load_jobs.values())).dst_spec
+    assert isinstance(dst, GPULoadStoreSpec)
+    return dst
+
+
+def test_replay_group_missing_window_does_not_gate_the_hit():
+    """An absent replay window must not cost the full-attention hit: the group
+    is not restored, contributes no load, and the request replays it."""
+    groups = _make_replay_groups()
+    scheduler, manager = _make_replay_scheduler(groups)
+    total, local = 1025, 512
+    request = _replay_request(total)
+    scheduler.on_new_request(request)
+    state = scheduler._req_status[request.request_id]
+    state.update_offload_keys()
+    _store_chunks(manager, state, 0, range(total // REPLAY_FULL_BLOCK))
+
+    external, load_async = scheduler.get_num_new_matched_tokens(request, local)
+
+    assert external == 1024 - local
+    assert load_async
+    assert state.restored_replay_group_ids == ()
+    assert scheduler.get_loaded_kv_cache_group_ids(request) == (0,)
+
+    _, blocks = _allocate_and_build(groups, request.request_id, local, external)
+    scheduler.update_state_after_alloc(request, blocks, external)
+
+    dst = _load_dst(scheduler)
+    assert dst.group_sizes == [external // REPLAY_FULL_BLOCK, 0]
+    assert dst.block_indices == [local // REPLAY_FULL_BLOCK, 0]
+    job = next(iter(scheduler._jobs.values()))
+    assert job.keys
+    # No replay-group key is loaded (none was looked up).
+    assert all(get_offload_group_idx(key) == 0 for key in job.keys)
+
+
+def test_replay_group_window_at_a_shorter_boundary_is_not_restored():
+    """A window that is present only for a boundary short of the final hit does
+    not count: the check runs at the returned boundary, not the maximal one."""
+    groups = _make_replay_groups()
+    scheduler, manager = _make_replay_scheduler(groups)
+    total, local = 1025, 512
+    request = _replay_request(total)
+    scheduler.on_new_request(request)
+    state = scheduler._req_status[request.request_id]
+    state.update_offload_keys()
+    _store_chunks(manager, state, 0, range(total // REPLAY_FULL_BLOCK))
+    # The window ending at 512 is in the CPU tier; the hit boundary is 1024.
+    _store_chunks(manager, state, 1, range(12, 16))
+
+    external, load_async = scheduler.get_num_new_matched_tokens(request, local)
+
+    assert external == 1024 - local
+    assert load_async
+    assert state.restored_replay_group_ids == ()
+    assert scheduler.get_loaded_kv_cache_group_ids(request) == (0,)
+
+    _, blocks = _allocate_and_build(groups, request.request_id, local, external)
+    scheduler.update_state_after_alloc(request, blocks, external)
+
+    dst = _load_dst(scheduler)
+    assert dst.group_sizes[1] == 0
+    job = next(iter(scheduler._jobs.values()))
+    assert all(get_offload_group_idx(key) == 0 for key in job.keys)
+
+
+def test_replay_group_window_overhanging_the_local_hit_is_not_loaded():
+    """A window that would start below the local hit cannot be written by the
+    load (it starts at the local boundary), so it is not restored."""
+    groups = _make_replay_groups()
+    scheduler, manager = _make_replay_scheduler(groups)
+    total, local = 1025, 512
+    request = _replay_request(total)
+    scheduler.on_new_request(request)
+    state = scheduler._req_status[request.request_id]
+    state.update_offload_keys()
+    # Full-attention hit one chunk past the local hit: boundary 576.
+    _store_chunks(manager, state, 0, range(9))
+    # The window [448, 576) reaches below the local hit; its early chunks are
+    # not in the tier and could not be loaded anyway.
+    _store_chunks(manager, state, 1, range(16, 18))
+
+    external, load_async = scheduler.get_num_new_matched_tokens(request, local)
+
+    assert external == 64
+    assert load_async
+    assert state.restored_replay_group_ids == ()
+
+    _, blocks = _allocate_and_build(groups, request.request_id, local, external)
+    scheduler.update_state_after_alloc(request, blocks, external)
+
+    dst = _load_dst(scheduler)
+    assert dst.group_sizes == [1, 0]
+    assert dst.block_indices == [local // REPLAY_FULL_BLOCK, 0]
+
+
+def _full_and_replayed_swa_groups(
+    full_block_size: int, swa_block_size: int, window: int
+) -> list[KVCacheGroupSpec]:
+    """Group 0 full attention, group 1 replaying sliding window (DSV4.1)."""
+    return [
+        KVCacheGroupSpec(
+            ["layer0"],
+            FullAttentionSpec(
+                block_size=full_block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer1"],
+            SlidingWindowMLASpec(
+                block_size=swa_block_size,
+                num_kv_heads=1,
+                max_tp_shards=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=window,
+                bounded_replay=True,
+            ),
+        ),
+    ]
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_replay_swa_window_stored_at_prompt_boundary_and_restored(
+    request_runner, async_scheduling: bool
+):
+    """The prompt boundary's window tail is offloaded and a later hit loads it
+    back into the freshly allocated window blocks, so nothing is replayed."""
+    block_size = 16
+    window = 32
+    prompt_tokens = 96
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=100,
+        async_scheduling=async_scheduling,
+        kv_cache_groups=_full_and_replayed_swa_groups(block_size, block_size, window),
+    )
+    runner.new_request(token_ids=[1] * prompt_tokens)
+    runner.manager.prepare_store.side_effect = lambda keys, ctx: generate_store_output(
+        keys
+    )
+    runner._run([0, 0, EOS_TOKEN_ID], complete_transfers=True)
+    stored = {
+        (block.group_idx, block.request_block_offset)
+        for transfer in runner.completed_stores
+        for block in transfer.gpu_blocks
+    }
+    runner.completed_stores.clear()
+    # Only window tails at the prompt horizon are stored for the replay group:
+    # chunks 4 and 5 cover tokens [64, 96), chunk 3 belongs to the boundary one
+    # alignment below (80). No dense per-segment tails.
+    swa_stored = {offset for group_idx, offset in stored if group_idx == 1}
+    assert {4, 5} <= swa_stored
+    assert swa_stored <= {3, 4, 5}
+
+    runner.scheduler.reset_prefix_cache()
+    runner.new_request(token_ids=[1] * (prompt_tokens + 4))
+    runner.manager.lookup.return_value = LookupResult.HIT
+    runner._run([0, 0], complete_transfers=True)
+    loaded = {
+        (block.group_idx, block.request_block_offset)
+        for transfer in runner.completed_loads
+        for block in transfer.gpu_blocks
+    }
+    assert loaded == set((0, i) for i in range(6)) | {(1, 4), (1, 5)}
+
+    request = runner.scheduler.requests["1"]
+    assert request.replay_start == 0
+    coordinator = runner.scheduler.kv_cache_manager.coordinator
+    swa_blocks = coordinator.single_type_managers[1].req_to_blocks["1"]
+    # Nothing below the restored window is real, and the window is not replayed.
+    assert all(block.is_null for block in swa_blocks[:4])
+    assert not any(block.is_null for block in swa_blocks[4:])
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_replay_swa_window_overhanging_local_hit_is_replayed(
+    request_runner, async_scheduling: bool
+):
+    """When the window would start below the local hit its first blocks cannot
+    be loaded, so the group is not reported and the window is replayed; the
+    full-attention hit itself is still served."""
+    full_block, swa_block, window = 128, 32, 128
+    local_tokens, prompt_tokens = 512, 992
+    runner = request_runner(
+        block_size=full_block,
+        num_gpu_blocks=100,
+        async_scheduling=async_scheduling,
+        kv_cache_groups=_full_and_replayed_swa_groups(
+            full_block, swa_block, window
+        ),
+    )
+    runner.manager.prepare_store.side_effect = lambda keys, ctx: generate_store_output(
+        keys
+    )
+
+    # Cache the first `local_tokens` on the GPU, then extend the same prompt.
+    runner.new_request(token_ids=[1] * local_tokens)
+    runner._run([EOS_TOKEN_ID], complete_transfers=True)
+    runner.completed_stores.clear()
+    runner.new_request(token_ids=[1] * prompt_tokens)
+
+    def lookup(key, req_context):
+        # The CPU tier holds three window chunks past the local hit, one short
+        # of the four-chunk window.
+        position = req_context.get_offload_key_position(key) or 0
+        if get_offload_group_idx(key) == 1 and position > 608:
+            return LookupResult.MISS
+        return LookupResult.HIT
+
+    runner.manager.lookup.side_effect = lookup
+    runner._run([0, 0], complete_transfers=True)
+    loaded = {
+        (block.group_idx, block.request_block_offset)
+        for transfer in runner.completed_loads
+        for block in transfer.gpu_blocks
+    }
+    # Only the full-attention group loads; the replay window is recomputed.
+    assert loaded
+    assert all(group_idx == 0 for group_idx, _ in loaded)
+
+    request = runner.scheduler.requests["1"]
+    # 512-token local hit, 384-token external hit (the FA group's stored
+    # chunks), replayed from the window's start.
+    assert request.replay_start == 896 - window
+
+
+def test_replay_group_store_mask_keeps_the_window_tail_per_segment():
+    """A replay group offloads only blocks a later window hit can reach: the
+    tail `need` blocks of every 128-token prompt segment, not the full window
+    of the prompt end."""
+    spec = SlidingWindowMLASpec(
+        block_size=32,
+        num_kv_heads=1,
+        max_tp_shards=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=64,
+        bounded_replay=True,
+    )
+    mask = SlidingWindowManager.reachable_block_mask(
+        start_block=0,
+        end_block=8,
+        alignment_tokens=128,
+        kv_cache_spec=spec,
+        use_eagle=False,
+    )
+    assert mask == [False, False, True, True, False, False, True, True]
+
+
+@pytest.mark.parametrize(
+    "num_local,num_external",
+    [
+        (0, 32),
+        (0, 1024),
+        (512, 32),
+        (512, 96),
+        (512, 512),
+        (896, 128),
+        (512, 513),
+    ],
+)
+def test_replay_group_reservation_matches_external_allocation(
+    num_local: int, num_external: int
+):
+    """Admission must reserve exactly the external blocks a replay group
+    allocates: `num_skipped` null blocks plus the window above them."""
+    groups = _make_replay_groups()
+    managers = _make_replay_managers(groups)
+    request_id = "reservation"
+    total = num_local + num_external
+    reserved = managers[1].get_num_blocks_to_allocate(
+        request_id, total, [], total, num_local, total
+    )
+
+    _allocate_external(managers, request_id, num_local, num_external)
+
+    req_blocks = managers[1].req_to_blocks[request_id]
+    num_skipped_blocks = max(0, total - REPLAY_WINDOW + 1) // REPLAY_SWA_BLOCK
+    assert reserved == len(managers[1].new_block_ids)
+    assert reserved == -(-total // REPLAY_SWA_BLOCK) - num_skipped_blocks
+    assert len(req_blocks) == -(-total // REPLAY_SWA_BLOCK)
+    assert all(block.is_null for block in req_blocks[:num_skipped_blocks])
+
+
+def _make_dsv41_replay_groups() -> list[KVCacheGroupSpec]:
+    """DSV4.1's shapes: the cacheable MLA full-attention group plus replay
+    groups with 128-token windows on 8-, 32- and 128-token blocks, so a
+    128-aligned hit loads 16/4/1 blocks."""
+    groups = [
+        KVCacheGroupSpec(
+            ["mla"],
+            MLAAttentionSpec(
+                block_size=128,
+                num_kv_heads=1,
+                max_tp_shards=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        )
+    ]
+    groups += [
+        KVCacheGroupSpec(
+            [f"swa{block_size}"],
+            SlidingWindowMLASpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                max_tp_shards=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=REPLAY_WINDOW,
+                bounded_replay=True,
+            ),
+        )
+        for block_size in (8, 32, 128)
+    ]
+    return groups
+
+
+def _make_dsv41_replay_scheduler(
+    num_chunks: int = 4096,
+) -> tuple[OffloadingConnectorScheduler, CPUOffloadingManager]:
+    groups = _make_dsv41_replay_groups()
+    manager = CPUOffloadingManager(num_chunks=num_chunks)
+    spec = SimpleNamespace(
+        config=SimpleNamespace(
+            groups=tuple(
+                SimpleNamespace(
+                    group_id=i, tokens_per_block=group.kv_cache_spec.block_size
+                )
+                for i, group in enumerate(groups)
+            )
+        ),
+        tokens_per_block=tuple(g.kv_cache_spec.block_size for g in groups),
+        tokens_per_hash=REPLAY_HASH,
+        blocks_per_chunk=1,
+        offload_prompt_only=True,
+        kv_events_config=OffloadingKVEventsConfig(
+            enable_kv_cache_events=False, self_describing_kv_events=False
+        ),
+        get_manager=lambda: manager,
+    )
+    config = SimpleNamespace(
+        speculative_config=None,
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=True, prefix_cache_retention_interval=None
+        ),
+        parallel_config=SimpleNamespace(world_size=1, decode_context_parallel_size=1),
+    )
+    scheduler = OffloadingConnectorScheduler(
+        spec,
+        config,
+        KVCacheConfig(num_blocks=512, kv_cache_tensors=[], kv_cache_groups=groups),
+    )
+    return scheduler, manager
+
+
+@pytest.mark.parametrize("max_num_new_tokens", [None, 512])
+def test_replay_group_load_span_equals_store_span(max_num_new_tokens):
+    """At a 128-aligned hit each replay group loads exactly the blocks the
+    store kept (16/4/1 for the 8/32/128-token blocks), starting at the first
+    block above the fully skipped ones, and the window is reported restored at
+    the final (possibly capped) hit boundary."""
+    scheduler, manager = _make_dsv41_replay_scheduler()
+    num_tokens = 1025
+    request = _replay_request(num_tokens)
+    scheduler.on_new_request(request)
+    state = scheduler._req_status[request.request_id]
+    state.update_offload_keys()
+    # No non-replay sliding-window group caps the hit by one token here, so a
+    # 512-token cap lands at 512 and the default at the full 1024.
+    hit = 1024 if max_num_new_tokens is None else max_num_new_tokens
+    # The full-attention group sets the hit; the replay windows sit at it.
+    _store_chunks(manager, state, 0, range(-(-hit // 128)))
+    for group_config, group_state in zip(
+        scheduler.config.kv_group_configs[1:], state.group_states[1:]
+    ):
+        block_size = group_config.tokens_per_block
+        num_window_blocks = -(-(REPLAY_WINDOW - 1) // block_size)
+        first_block = -(-(hit - REPLAY_WINDOW) // block_size)
+        _store_chunks(
+            manager,
+            state,
+            group_config.group_idx,
+            range(first_block, first_block + num_window_blocks),
+        )
+
+    external, load_async = scheduler.get_num_new_matched_tokens(
+        request, 0, max_num_new_tokens
+    )
+
+    assert external == hit
+    assert load_async
+    assert scheduler.get_loaded_kv_cache_group_ids(request) == (0, 1, 2, 3)
+
+    managers = _make_replay_managers(_make_dsv41_replay_groups(), num_blocks=512)
+    for group_config, manager_ in zip(
+        scheduler.config.kv_group_configs[1:], managers[1:]
+    ):
+        block_size = group_config.tokens_per_block
+        num_window_blocks = -(-(REPLAY_WINDOW - 1) // block_size)
+        # The store keeps exactly this many blocks per group.
+        assert SlidingWindowManager._contiguous_blocks_for_hit(
+            REPLAY_WINDOW, block_size, use_eagle=False
+        ) == num_window_blocks
+        assert (
+            manager_.get_num_blocks_to_allocate(
+                request.request_id, hit, [], hit, 0, hit
+            )
+            == num_window_blocks
+        )
+    _allocate_external(managers, request.request_id, 0, external)
+    for group_config, manager_ in zip(
+        scheduler.config.kv_group_configs[1:], managers[1:]
+    ):
+        block_size = group_config.tokens_per_block
+        skipped_blocks = (hit - REPLAY_WINDOW + 1) // block_size
+        num_window_blocks = -(-(REPLAY_WINDOW - 1) // block_size)
+        req_blocks = manager_.req_to_blocks[request.request_id]
+        assert len(req_blocks) == -(-hit // block_size)
+        assert all(block.is_null for block in req_blocks[:skipped_blocks])
+        assert not any(block.is_null for block in req_blocks[skipped_blocks:])
+        assert manager_.new_block_ids == [
+            block.block_id for block in req_blocks[skipped_blocks:]
+        ]
+
+    blocks = KVCacheBlocks(
+        tuple(manager_.req_to_blocks[request.request_id] for manager_ in managers)
+    )
+    scheduler.update_state_after_alloc(request, blocks, external)
+
+    dst = next(iter(scheduler._current_batch_load_jobs.values())).dst_spec
+    assert isinstance(dst, GPULoadStoreSpec)
+    # The full-attention load, then 16/4/1 window blocks per replay group.
+    assert dst.group_sizes == [-(-hit // 128), 16, 4, 1]
+    # The load starts at the block holding the first window token, i.e. the
+    # blocks the SWA manager leaves above its null head.
+    assert dst.block_indices == [
+        0,
+        -(-(hit - REPLAY_WINDOW) // 8),
+        -(-(hit - REPLAY_WINDOW) // 32),
+        -(-(hit - REPLAY_WINDOW) // 128),
+    ]
+    offset = -(-hit // 128)
+    for group_config, manager_ in zip(
+        scheduler.config.kv_group_configs[1:], managers[1:]
+    ):
+        block_size = group_config.tokens_per_block
+        skipped_blocks = (hit - REPLAY_WINDOW + 1) // block_size
+        num_window_blocks = -(-(REPLAY_WINDOW - 1) // block_size)
+        assert dst.block_ids[offset : offset + num_window_blocks].tolist() == [
+            block.block_id
+            for block in manager_.req_to_blocks[request.request_id][
+                skipped_blocks:
+            ]
+        ]
+        offset += num_window_blocks
+
+
+@pytest.mark.parametrize("decoded_tokens", [0, 128])
+def test_replay_group_store_is_one_window_per_prompt_not_dense(decoded_tokens: int):
+    """With dense retention configured, a replay group still stores only the
+    prompt horizon's window tail (one window per group for a 100k prompt),
+    never a tail per 128-token segment, even once decode passed the horizon."""
+    scheduler, _ = _make_dsv41_replay_scheduler()
+    prompt_tokens = 100_000
+    request = _replay_request(prompt_tokens)
+    scheduler.on_new_request(request)
+    state = scheduler._req_status[request.request_id]
+    state.update_offload_keys()
+    for group_config, group_state in zip(
+        scheduler.config.kv_group_configs, state.group_states
+    ):
+        num_chunks = prompt_tokens // group_config.tokens_per_chunk
+        group_state.block_ids.extend(range(1, num_chunks + 1))
+    request.is_finished.return_value = True
+    request.status = RequestStatus.FINISHED_STOPPED
+    request.num_computed_tokens = prompt_tokens + decoded_tokens
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={}, finished_req_ids={request.request_id}
+    )
+
+    jobs = scheduler._build_store_jobs(scheduler_output)
+
+    src = next(iter(jobs.values())).src_spec
+    assert isinstance(src, GPULoadStoreSpec)
+    # 128-aligned prompt horizon: 99840. The same-prompt hit one alignment
+    # below lands on the same boundary, so each group stores one window.
+    horizon = 99_968
+    assert src.group_sizes == [prompt_tokens // 128, 16, 4, 1]
+    assert src.block_indices == [
+        0,
+        horizon // 8 - 16,
+        horizon // 32 - 4,
+        horizon // 128 - 1,
+    ]

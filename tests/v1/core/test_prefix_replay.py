@@ -356,3 +356,38 @@ def test_kv_load_zeroing_respects_loaded_groups(is_async, loads_window):
             assert not new_ids & zeroed
         else:
             assert new_ids <= zeroed
+
+
+def test_window_load_allocates_only_the_window():
+    """A replay group's external blocks are exactly its window above a null
+    head; a load that restores the window replays nothing and needs no
+    zeroing."""
+    matched = 5 * BLOCK_SIZE
+    scheduler = _replay_scheduler(
+        use_kv_connector=MockKVConfig(matched_tokens=matched, is_async=True)
+    )
+    scheduler.connector.get_loaded_kv_cache_group_ids = lambda request: (FULL, SWA)
+    request = create_requests(
+        num_requests=1, num_tokens=NUM_PROMPT_TOKENS, block_size=BLOCK_SIZE
+    )[0]
+    scheduler.add_request(request)
+    out = scheduler.schedule()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+    manager = scheduler.kv_cache_manager
+    swa_blocks = manager.get_blocks(request.request_id).blocks[SWA]
+    num_skipped_blocks = (matched - WINDOW + 1) // BLOCK_SIZE
+    assert len(swa_blocks) == -(-matched // BLOCK_SIZE)
+    assert all(b.is_null for b in swa_blocks[:num_skipped_blocks])
+    assert not any(b.is_null for b in swa_blocks[num_skipped_blocks:])
+    # The window is written by the load, so it must not be zeroed.
+    window_ids = {b.block_id for b in swa_blocks[num_skipped_blocks:]}
+    assert window_ids
+    assert not window_ids & set(out.new_block_ids_to_zero or ())
+
+    scheduler.update_from_output(
+        out, create_model_runner_output([], finished_recving={request.request_id})
+    )
+    out = scheduler.schedule()
+    assert request.replay_start == 0
+    assert _new_req_data(out, request).num_computed_tokens == matched

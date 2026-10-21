@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 import time
 from collections import Counter
 from collections.abc import Iterable, Iterator, Sequence
@@ -323,6 +324,8 @@ class SchedulerOffloadConfig(NamedTuple):
             for config in kv_group_configs:
                 if (
                     config.sliding_window_size_in_chunks is not None
+                    # Replay groups always use sparse-retention (0) semantics.
+                    and config.kv_cache_spec.prefix_replay_tokens == 0
                     and retention_interval % config.tokens_per_chunk != 0
                 ):
                     raise ValueError(
@@ -380,6 +383,8 @@ class RequestOffloadState:
     # Loaded attention keys cover their token positions. Recurrent state
     # supports the whole reused external prefix.
     load_key_ranges: list[tuple[int, int, OffloadKey]] = field(default_factory=list)
+    # Replay groups whose complete window the planned load restores.
+    restored_replay_group_ids: tuple[int, ...] = ()
     # True once on_request_finished has been signaled to the manager.
     finished_signaled: bool = False
 
@@ -598,7 +603,47 @@ class OffloadingConnectorScheduler:
         # used by _lookup
         self._full_attention_groups: tuple[int, ...] = tuple(full_attention_groups)
         self._sliding_window_groups: tuple[int, ...] = tuple(sliding_window_groups)
-        self._lookup_groups = self._full_attention_groups + self._sliding_window_groups
+        # A replay group's window is opportunistic: a hit is accepted without
+        # it and replayed, so only non-replay sliding-window groups may gate
+        # the hit. Replay groups join via _restored_replay_group_ids().
+        group_configs = self.config.kv_group_configs
+        self._lookup_sliding_window_groups: tuple[int, ...] = tuple(
+            group_idx
+            for group_idx in self._sliding_window_groups
+            if group_configs[group_idx].kv_cache_spec.prefix_replay_tokens == 0
+        )
+        self._lookup_groups = (
+            self._full_attention_groups + self._lookup_sliding_window_groups
+        )
+        # Groups whose hash-addressed KV holds no window: a hit needs the load
+        # to restore it, which get_loaded_kv_cache_group_ids reports.
+        self._prefix_cacheable_group_ids = kv_cache_config.prefix_cacheable_group_ids
+        replay_group_configs = [
+            group_config
+            for group_config in group_configs
+            if group_config.kv_cache_spec.prefix_replay_tokens > 0
+        ]
+        # Real KV cache group ids: the scheduler's prefix_replay_group_ids and
+        # ``get_loaded_kv_cache_group_ids`` use these, not config positions.
+        self._replay_group_ids: tuple[int, ...] = tuple(
+            group_config.group_idx for group_config in replay_group_configs
+        )
+        # A replay window is stored (and therefore loadable) only at the
+        # store mask's boundaries, which are ``alignment_tokens`` boundaries.
+        # Cap a hit there when replay groups are offloaded so the window a
+        # later request asks for is the one the store kept.
+        replay_blocks = [
+            group_config.tokens_per_block for group_config in replay_group_configs
+        ]
+        alignment = self.config.alignment_tokens
+        if replay_blocks and (
+            alignment is None
+            or any(alignment % block_size for block_size in replay_blocks)
+        ):
+            alignment = max(replay_blocks)
+        self._replay_hit_alignment: int | None = (
+            alignment if replay_blocks else None
+        )
         self._mamba_align_size: int | None = resolve_mamba_align_size(
             spec, kv_cache_config
         )
@@ -841,7 +886,7 @@ class OffloadingConnectorScheduler:
                 max_hit_size_tokens,
                 num_computed_tokens + req_status.max_load_tokens,
             )
-        if self._sliding_window_groups:
+        if self._lookup_sliding_window_groups:
             # the last prompt token has to be recomputed to get the logprobs
             # for sliding window attention, we must reduce by 1 to make sure
             # we still have a hit after reduction
@@ -851,6 +896,13 @@ class OffloadingConnectorScheduler:
                 max_hit_size_tokens = round_down(
                     max_hit_size_tokens, self._mamba_align_size
                 )
+        if self._replay_hit_alignment is not None:
+            # Offloaded replay windows live on the store mask's boundaries, so
+            # a hit must land there for the load to restore one. The tokens
+            # past the boundary are prefilled as usual.
+            max_hit_size_tokens = round_down(
+                max_hit_size_tokens, self._replay_hit_alignment
+            )
 
         num_hit_tokens: int = 0
         defer_lookup = False
@@ -973,7 +1025,7 @@ class OffloadingConnectorScheduler:
                     elif looked_up_sliding_window and not lookup_groups:
                         # we need another iteration to confirm previously looked up
                         # sliding window works with the new_num_hit_tokens
-                        lookup_groups = self._sliding_window_groups
+                        lookup_groups = self._lookup_sliding_window_groups
 
                 looked_up_sliding_window |= sliding_window_size_in_chunks is not None
                 num_hit_tokens = new_num_hit_tokens
@@ -1106,6 +1158,86 @@ class OffloadingConnectorScheduler:
         )
         self._req_status[request.request_id] = req_status
 
+    @staticmethod
+    def _num_skipped_blocks(group_config: GroupOffloadConfig, num_tokens: int) -> int:
+        """Null head blocks a replay group pads for ``num_tokens`` computed
+        tokens, mirroring ``SlidingWindowManager.get_num_skipped_tokens``."""
+        num_skipped_tokens = max(
+            0,
+            num_tokens
+            - group_config.kv_cache_spec.prefix_replay_tokens
+            + 1
+            - getattr(group_config.kv_cache_spec, "extra_retained_tokens", 0),
+        )
+        return num_skipped_tokens // group_config.tokens_per_block
+
+    def _restored_replay_group_ids(
+        self, req_status: RequestOffloadState, num_hit_tokens: int
+    ) -> tuple[int, ...]:
+        """Replay groups whose complete load window the planned load restores.
+
+        Checked at the final returned hit boundary, against the same chunks the
+        load reads (``load_window_size_in_chunks``). A group qualifies only if
+        the load, which starts at the first real block, covers that whole
+        window: a window overhanging the null head or the local hit boundary
+        stays partially unwritten and must be replayed.
+        """
+        boundary = req_status.num_locally_computed_tokens + num_hit_tokens
+        restored: list[int] = []
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            window = group_config.kv_cache_spec.prefix_replay_tokens
+            if window <= 0 or boundary < window:
+                # A hit no longer than the window is replayed in full.
+                continue
+            num_window_chunks = group_config.load_window_size_in_chunks(boundary)
+            if num_window_chunks is None:
+                continue
+            tokens_per_chunk = group_config.tokens_per_chunk
+            end_chunk = cdiv(boundary, tokens_per_chunk)
+            first_chunk = end_chunk - num_window_chunks
+            # ``update_state_after_alloc`` starts the load at the first real
+            # block: past the null head and no earlier than the local hit.
+            load_start_block = max(
+                self._num_skipped_blocks(group_config, boundary),
+                cdiv(
+                    req_status.num_locally_computed_tokens,
+                    group_config.tokens_per_block,
+                ),
+            )
+            if first_chunk < load_start_block // self.config.blocks_per_chunk:
+                continue
+            keys = group_state.offload_keys[first_chunk:end_chunk]
+            if len(keys) != num_window_chunks:
+                continue
+            if all(
+                self.manager.lookup(key, req_status.req_context) is LookupResult.HIT
+                for key in keys
+            ):
+                restored.append(group_config.group_idx)
+            elif logger.isEnabledFor(logging.DEBUG):
+                missing = sum(
+                    self.manager.lookup(key, req_status.req_context)
+                    is not LookupResult.HIT
+                    for key in keys
+                )
+                logger.debug(
+                    "replay window not restored: group=%d boundary=%d chunks=%d "
+                    "missing=%d",
+                    group_config.group_idx,
+                    boundary,
+                    len(keys),
+                    missing,
+                )
+        return tuple(restored)
+
+    def get_loaded_kv_cache_group_ids(self, request: Request) -> tuple[int, ...]:
+        """Groups whose KV the planned load restores for ``request``."""
+        req_status = self._req_status.get(request.request_id)
+        restored = req_status.restored_replay_group_ids if req_status else ()
+        return self._prefix_cacheable_group_ids + restored
+
     def get_num_new_matched_tokens(
         self,
         request: Request,
@@ -1150,6 +1282,7 @@ class OffloadingConnectorScheduler:
 
         req_status.update_offload_keys()
         req_status.num_locally_computed_tokens = num_computed_tokens
+        req_status.restored_replay_group_ids = ()
 
         num_hit_tokens: int | None
         if request.skip_reading_prefix_cache:
@@ -1166,6 +1299,33 @@ class OffloadingConnectorScheduler:
                     req_status.deferred_lookup_start_time = lookup_start
             else:
                 self._maybe_observe_lookup_async_delay(req_status)
+        if num_hit_tokens:
+            req_status.restored_replay_group_ids = self._restored_replay_group_ids(
+                req_status, num_hit_tokens
+            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "replay restore check: local=%d hit=%d restored=%s",
+                    num_computed_tokens,
+                    num_hit_tokens,
+                    req_status.restored_replay_group_ids,
+                )
+        if req_status.restored_replay_group_ids:
+            if set(self._replay_group_ids) <= set(
+                req_status.restored_replay_group_ids
+            ):
+                logger.info_once(
+                    "KV offload: restored the SWA replay window for a prefix "
+                    "hit (%d groups); replay is skipped.",
+                    len(req_status.restored_replay_group_ids),
+                )
+            else:
+                # The scheduler replays any window this load does not carry.
+                logger.debug(
+                    "KV offload: restored %d of %d SWA replay windows.",
+                    len(req_status.restored_replay_group_ids),
+                    len(self._replay_group_ids),
+                )
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 
         return num_hit_tokens, bool(num_hit_tokens)
@@ -1278,6 +1438,22 @@ class OffloadingConnectorScheduler:
             assert num_locally_computed_tokens % tokens_per_block == 0
             num_pending_gpu_blocks = num_gpu_blocks - load_start_gpu_block_idx
 
+            # A replay group only contributes a load when its window was
+            # restored; otherwise the request replays it, its chunks were never
+            # looked up, and the load must not overwrite its blocks.
+            loads_group = (
+                group_config.kv_cache_spec.prefix_replay_tokens == 0
+                or group_config.group_idx in req_status.restored_replay_group_ids
+            )
+            if loads_group and group_config.kv_cache_spec.prefix_replay_tokens > 0:
+                num_window_chunks = group_config.load_window_size_in_chunks(
+                    num_cached_tokens
+                )
+                assert num_window_chunks is not None
+                assert num_pending_gpu_blocks == (
+                    num_window_chunks * self.config.blocks_per_chunk
+                ), "a restored replay window must load its whole span"
+
             if group_config.sliding_window_size_in_chunks is not None:
                 assert (
                     num_pending_gpu_blocks
@@ -1287,7 +1463,7 @@ class OffloadingConnectorScheduler:
                 )
 
             num_chunks = cdiv(num_cached_tokens, tokens_per_chunk)
-            if num_pending_gpu_blocks:
+            if loads_group and num_pending_gpu_blocks:
                 start_chunk_idx = (
                     load_start_gpu_block_idx // self.config.blocks_per_chunk
                 )
@@ -1322,12 +1498,15 @@ class OffloadingConnectorScheduler:
                         )
                         req_status.load_key_ranges.append((range_start, range_end, key))
 
-            dst_block_ids.extend(
-                block.block_id
-                for block in group_blocks[load_start_gpu_block_idx:num_gpu_blocks]
-            )
-            group_sizes.append(num_pending_gpu_blocks)
-            block_indices.append(load_start_gpu_block_idx)
+            if loads_group:
+                load_blocks = group_blocks[load_start_gpu_block_idx:num_gpu_blocks]
+                dst_block_ids.extend(block.block_id for block in load_blocks)
+                group_sizes.append(num_pending_gpu_blocks)
+                block_indices.append(load_start_gpu_block_idx)
+            else:
+                # Nothing is loaded for this group; keep the spec aligned.
+                group_sizes.append(0)
+                block_indices.append(0)
 
             # Skip prefix-hit chunks for block-level policy; for
             # request-level, next_stored_chunk_idx stays at 0 so all
@@ -1374,6 +1553,8 @@ class OffloadingConnectorScheduler:
             if preempted:
                 for group_state in req_status.group_states:
                     group_state.block_ids.clear()
+                # The blocks are released; a restored window must be re-loaded.
+                req_status.restored_replay_group_ids = ()
 
             if new_block_id_groups:
                 if self._sliding_window_groups:
@@ -1625,7 +1806,14 @@ class OffloadingConnectorScheduler:
             alignment_tokens=self.config.alignment_tokens,
             kv_cache_spec=kv_cache_spec,
             use_eagle=group_config.is_eagle_group,
-            retention_interval=self.config.retention_interval,
+            # A replay group's window is only reachable at a request boundary,
+            # so it is stored with sparse-retention semantics: the window tail
+            # of each ``reachable_boundary`` and no dense per-segment tails.
+            retention_interval=(
+                0
+                if group_config.kv_cache_spec.prefix_replay_tokens > 0
+                else self.config.retention_interval
+            ),
             reachable_boundaries=reachable_boundaries,
             dcp_world_size=self.config.dcp_world_size,
             final_segment_end_block=(
@@ -1648,6 +1836,26 @@ class OffloadingConnectorScheduler:
         ):
             return None
         return alignment_tokens // group_config.tokens_per_block
+
+    def _store_reachable_boundaries(
+        self, group_config: GroupOffloadConfig, req: Request
+    ) -> tuple[int, ...]:
+        """Token boundaries a later load hit can land on, for the store mask.
+
+        Replay groups are stored with sparse-retention semantics (only the
+        prompt horizon, never dense per-segment tails): a hit is capped at
+        ``num_tokens - 1`` for its own request, so the same-prompt boundary one
+        alignment below the horizon is reachable too.
+        """
+        if group_config.kv_cache_spec.prefix_replay_tokens > 0:
+            boundaries = (req.num_prompt_tokens - 1, req.num_prompt_tokens)
+        elif self.config.retention_interval is not None:
+            boundaries = (req.num_prompt_tokens - 1,)
+        else:
+            return ()
+        if req.shared_prefix_boundary:
+            boundaries += (req.shared_prefix_boundary,)
+        return boundaries
 
     def _build_store_jobs(
         self,
@@ -1687,15 +1895,12 @@ class OffloadingConnectorScheduler:
             new_offload_keys: list[OffloadKey] = []
             group_store_ranges: list[tuple[int, int]] = []
 
-            reachable_boundaries: tuple[int, ...] = ()
-            if self.config.retention_interval is not None:
-                reachable_boundaries = (req.num_prompt_tokens - 1,)
-                if req.shared_prefix_boundary:
-                    reachable_boundaries += (req.shared_prefix_boundary,)
-
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
+                reachable_boundaries = self._store_reachable_boundaries(
+                    group_config, req
+                )
                 num_chunks = req_status.storable_chunks(
                     group_config, group_state, num_offloadable_tokens
                 )
@@ -1767,6 +1972,32 @@ class OffloadingConnectorScheduler:
                     final_segment_end_chunk_idx=store_horizon_chunks,
                     reachable_boundaries=reachable_boundaries,
                 )
+
+                if (
+                    group_config.kv_cache_spec.prefix_replay_tokens > 0
+                    and logger.isEnabledFor(logging.DEBUG)
+                ):
+                    accepted = sum(
+                        1
+                        for key_idx, block_id in enumerate(offload_block_ids)
+                        if block_id
+                        and (
+                            block_mask is None
+                            or any(
+                                block_mask[key_idx * blocks_per_chunk + b]
+                                for b in range(blocks_per_chunk)
+                            )
+                        )
+                    )
+                    logger.debug(
+                        "replay store: group=%d range=[%d,%d) accepted=%d "
+                        "mask_tail=%s",
+                        group_config.group_idx,
+                        start_chunk_idx,
+                        num_chunks,
+                        accepted,
+                        None if block_mask is None else block_mask[-4:],
+                    )
 
                 prompt_horizon_block_mask: list[bool] | None = None
                 if reconsider_final_swa_tail:
