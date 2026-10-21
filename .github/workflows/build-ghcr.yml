@@ -6,9 +6,8 @@ name: Build SM80 CUDA image (ghcr)
 #
 # The image is `docker/Dockerfile`'s vllm-openai target, compiled only for
 # sm_80 with the port's minimal build (no SM90/SM100 external projects, FA3 is
-# skipped automatically when the arch list has no SM90). FA2 is built unless
-# the `skip_flash_attn` input is set; a text-only image needs
-# `MM_ATTN_BACKEND=TRITON_ATTN` for the ViT.
+# skipped automatically when the arch list has no SM90). The wheel is text-only
+# (no FA2/FA3), so serve with `MM_ATTN_BACKEND=TRITON_ATTN` for the ViT.
 
 on:
   workflow_dispatch:
@@ -16,10 +15,6 @@ on:
       image_tag:
         description: "Tag to publish in addition to the commit tag"
         default: dsv4-ampere
-      skip_flash_attn:
-        description: "Build a text-only wheel (no FA2; ViT needs TRITON_ATTN)"
-        type: boolean
-        default: false
   push:
     branches: [dsv4-ampere]
     paths:
@@ -82,8 +77,6 @@ jobs:
           build-args: |
             CUDA_VERSION=13.0.3
             torch_cuda_arch_list=8.0
-            VLLM_SM80_MINIMAL_BUILD=1
-            VLLM_SKIP_FLASH_ATTN=${{ inputs.skip_flash_attn && '1' || '' }}
             max_jobs=2
             nvcc_threads=4
           tags: |

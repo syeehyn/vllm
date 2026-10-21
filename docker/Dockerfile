@@ -194,14 +194,12 @@ RUN gcc --version
 # See: https://docs.nvidia.com/deploy/cuda-compatibility/
 ENV VLLM_ENABLE_CUDA_COMPATIBILITY=0
 
-# SM80 (Ampere) port switches. Declared in `base` so every build stage inherits
-# them: VLLM_SM80_MINIMAL_BUILD skips the SM90/SM100 external projects, and
-# VLLM_SKIP_FLASH_ATTN builds a text-only wheel (the ViT then needs
-# MM_ATTN_BACKEND=TRITON_ATTN).
-ARG VLLM_SM80_MINIMAL_BUILD=""
-ENV VLLM_SM80_MINIMAL_BUILD=${VLLM_SM80_MINIMAL_BUILD}
-ARG VLLM_SKIP_FLASH_ATTN=""
-ENV VLLM_SKIP_FLASH_ATTN=${VLLM_SKIP_FLASH_ATTN}
+# This branch targets SM80 (A100/A800) only. The port's CMake switches are
+# "defined = skip", so both are set here: the wheel is built without the
+# SM90/SM100 external projects and without FA2/FA3. The ViT then needs
+# MM_ATTN_BACKEND=TRITON_ATTN. Remove the FA2 line to build a full image.
+ENV VLLM_SM80_MINIMAL_BUILD=1
+ENV VLLM_SKIP_FLASH_ATTN=1
 
 # ============================================================
 # SLOW-CHANGING DEPENDENCIES BELOW
@@ -914,14 +912,12 @@ RUN chmod 0755 /usr/local/bin/vllm-nonroot-entrypoint.sh
 # See: https://docs.nvidia.com/deploy/cuda-compatibility/
 ENV VLLM_ENABLE_CUDA_COMPATIBILITY=0
 
-# SM80 (Ampere) port switches. Declared in `base` so every build stage inherits
-# them: VLLM_SM80_MINIMAL_BUILD skips the SM90/SM100 external projects, and
-# VLLM_SKIP_FLASH_ATTN builds a text-only wheel (the ViT then needs
-# MM_ATTN_BACKEND=TRITON_ATTN).
-ARG VLLM_SM80_MINIMAL_BUILD=""
-ENV VLLM_SM80_MINIMAL_BUILD=${VLLM_SM80_MINIMAL_BUILD}
-ARG VLLM_SKIP_FLASH_ATTN=""
-ENV VLLM_SKIP_FLASH_ATTN=${VLLM_SKIP_FLASH_ATTN}
+# This branch targets SM80 (A100/A800) only. The port's CMake switches are
+# "defined = skip", so both are set here: the wheel is built without the
+# SM90/SM100 external projects and without FA2/FA3. The ViT then needs
+# MM_ATTN_BACKEND=TRITON_ATTN. Remove the FA2 line to build a full image.
+ENV VLLM_SM80_MINIMAL_BUILD=1
+ENV VLLM_SKIP_FLASH_ATTN=1
 
 # ============================================================
 # SLOW-CHANGING DEPENDENCIES BELOW
