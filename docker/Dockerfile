@@ -194,6 +194,15 @@ RUN gcc --version
 # See: https://docs.nvidia.com/deploy/cuda-compatibility/
 ENV VLLM_ENABLE_CUDA_COMPATIBILITY=0
 
+# SM80 (Ampere) port switches. Declared in `base` so every build stage inherits
+# them: VLLM_SM80_MINIMAL_BUILD skips the SM90/SM100 external projects, and
+# VLLM_SKIP_FLASH_ATTN builds a text-only wheel (the ViT then needs
+# MM_ATTN_BACKEND=TRITON_ATTN).
+ARG VLLM_SM80_MINIMAL_BUILD=""
+ENV VLLM_SM80_MINIMAL_BUILD=${VLLM_SM80_MINIMAL_BUILD}
+ARG VLLM_SKIP_FLASH_ATTN=""
+ENV VLLM_SKIP_FLASH_ATTN=${VLLM_SKIP_FLASH_ATTN}
+
 # ============================================================
 # SLOW-CHANGING DEPENDENCIES BELOW
 # These are the expensive layers that we want to cache
@@ -904,6 +913,15 @@ RUN chmod 0755 /usr/local/bin/vllm-nonroot-entrypoint.sh
 # Only needed for datacenter/professional GPUs with older drivers.
 # See: https://docs.nvidia.com/deploy/cuda-compatibility/
 ENV VLLM_ENABLE_CUDA_COMPATIBILITY=0
+
+# SM80 (Ampere) port switches. Declared in `base` so every build stage inherits
+# them: VLLM_SM80_MINIMAL_BUILD skips the SM90/SM100 external projects, and
+# VLLM_SKIP_FLASH_ATTN builds a text-only wheel (the ViT then needs
+# MM_ATTN_BACKEND=TRITON_ATTN).
+ARG VLLM_SM80_MINIMAL_BUILD=""
+ENV VLLM_SM80_MINIMAL_BUILD=${VLLM_SM80_MINIMAL_BUILD}
+ARG VLLM_SKIP_FLASH_ATTN=""
+ENV VLLM_SKIP_FLASH_ATTN=${VLLM_SKIP_FLASH_ATTN}
 
 # ============================================================
 # SLOW-CHANGING DEPENDENCIES BELOW
