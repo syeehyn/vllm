@@ -14,7 +14,12 @@ from vllm.utils.torch_utils import get_kv_cache_torch_dtype
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
+    AttentionLayer,
     MultipleOf,
+)
+from vllm.v1.attention.backends.mla.sparse_utils import (
+    flat_kv_row_view,
+    triton_convert_req_index_to_global_index,
 )
 from vllm.v1.attention.backends.mla.xpu_mla_sparse import (
     XPUMLASparseImpl,
@@ -26,10 +31,12 @@ from vllm.v1.attention.ops.mqa_logits_triton import (
     warmup_fp8_paged_mqa_logits_triton,
 )
 from vllm.v1.attention.ops.triton_mla_sparse_kernel import (
+    _BLOCK_DMODEL,
     _DIM_QK,
     KV_SPLITS_CANDIDATES,
     triton_mla_sparse_attention,
 )
+from vllm.v1.kv_cache_interface import is_quantized_kv_cache
 
 # V3.2 indexers don't expose `n_head`; GLM-5.1-NVFP4 sets index_n_heads=32.
 # Autotune key includes (num_heads, head_dim), so a wrong warmup shape forces
@@ -66,8 +73,10 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
         cfg = get_current_vllm_config_or_none()
         model_dtype = cfg.model_config.dtype if cfg is not None else torch.bfloat16
         kv_dtype = get_kv_cache_torch_dtype(self.kv_cache_dtype, model_dtype)
-        q = torch.empty(1, self.num_heads, _DIM_QK, dtype=model_dtype, device=device)
-        kv = torch.empty(64, 1, _DIM_QK, dtype=kv_dtype, device=device)
+        q = torch.empty(
+            1, self.num_heads, self.head_size, dtype=model_dtype, device=device
+        )
+        kv = torch.empty(64, 1, self.head_size, dtype=kv_dtype, device=device)
         indices = torch.zeros(1, 1, topk, dtype=torch.int32, device=device)
         for splits in KV_SPLITS_CANDIDATES:
             triton_mla_sparse_attention(
@@ -90,6 +99,47 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 block_size=cfg.cache_config.block_size,
                 device=device,
             )
+
+    def forward_mqa(
+        self,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: XPUMLASparseMetadata,
+        layer: AttentionLayer,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Convert top-k indices over the buffer's full width.
+
+        The base impl takes ``attn_metadata.topk_tokens`` (= index_topk) as the
+        conversion width. kpool models reserve ``index_topk + index_kpool - 1``
+        columns rounded up to the conversion tile, and those tail columns hold
+        real indices for the request's incomplete pool, so they must be
+        converted too. Any remaining columns are -1, which the sparse kernel
+        masks.
+        """
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            raise NotImplementedError(
+                "FP8 kv is not supported with the Triton sparse MLA backend"
+            )
+        if isinstance(q, tuple):
+            q = torch.cat(q, dim=-1)
+        num_actual_tokens = q.shape[0]
+        assert self.topk_indices_buffer is not None
+        topk_indices = self.topk_indices_buffer[:num_actual_tokens]
+        kv_rows, block_stride_rows = flat_kv_row_view(
+            kv_c_and_k_pe_cache, attn_metadata.block_size
+        )
+        topk_indices_global = triton_convert_req_index_to_global_index(
+            attn_metadata.req_id_per_token,
+            attn_metadata.block_table,
+            topk_indices,
+            BLOCK_SIZE=attn_metadata.block_size,
+            BLOCK_STRIDE_ROWS=block_stride_rows,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+        )
+        attn_out = self._forward_bf16_kv(
+            q, kv_rows, topk_indices_global, attn_metadata
+        )
+        return attn_out, None
 
     def _forward_bf16_kv(
         self,
@@ -180,8 +230,41 @@ class TritonMLASparseBackend(AttentionBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        """Return the supported sparse MLA head dimension."""
-        return [_DIM_QK]
+        """Return the supported sparse MLA head dimension.
+
+        d_qk = kv_lora_rank + rope: 576 for V3.2 / GLM-5.1, 512 for the
+        NoPE-only GLM-5.3 attention (qk_rope_head_dim == 0).
+        """
+        return [_BLOCK_DMODEL, _DIM_QK]
+
+    @classmethod
+    def supports_combination(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: "CacheDType | None",
+        block_size: int | None,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        use_mm_prefix: bool,
+        device_capability: DeviceCapability,
+    ) -> str | None:
+        if head_size == _BLOCK_DMODEL:
+            # The kernel treats a 512-wide QK as the NoPE part alone, which is
+            # only correct for rope-free models (GLM-5.3). A rope-carrying
+            # model with kv_lora_rank 448 also lands on 512; keep it out.
+            from vllm.config import get_current_vllm_config
+
+            vllm_config = get_current_vllm_config()
+            if vllm_config.model_config is not None:
+                hf_text_config = vllm_config.model_config.hf_text_config
+                if getattr(hf_text_config, "qk_rope_head_dim", 64) != 0:
+                    return (
+                        "TRITON_MLA_SPARSE supports head_size 512 only for "
+                        "rope-free (NoPE) models"
+                    )
+        return None
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:

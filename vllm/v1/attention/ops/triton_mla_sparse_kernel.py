@@ -9,11 +9,14 @@ import torch
 from vllm.triton_utils import LOG2E, LOGE2, tl, triton
 from vllm.utils.platform_utils import num_compute_units
 
-# DeepSeek-V3.2 / GLM-5 sparse MLA shape constants.
+# DeepSeek-V3.2 / GLM-5 sparse MLA shape constants. _BLOCK_DPE is the rope
+# width of the RoPE models; NoPE-only GLM-5.3 has no rope lanes, so its
+# absorbed QK dim is kv_lora_rank == _BLOCK_DMODEL.
 _BLOCK_DMODEL = 512
 _BLOCK_DPE = 64
 _BLOCK_DV = 512
 _DIM_QK = _BLOCK_DMODEL + _BLOCK_DPE  # 576
+_SUPPORTED_DIM_QK = (_BLOCK_DMODEL, _DIM_QK)  # GLM-5.3 (NoPE), V3.2 / GLM-5.1
 
 _BLOCK_H = 16
 # Smallest BLOCK_N the autotune sweep offers; only used for the topk-divisibility
@@ -73,9 +76,7 @@ def _sparse_mla_compute_tile(
     """Shared stage-1 body: load Q, run the sparse online-softmax loop over
     `[split_start, split_end)` of the topk axis, return accumulators."""
     offs_d = tl.arange(0, BLOCK_DMODEL)
-    offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
     offs_dv = tl.arange(0, BLOCK_DV)
-    mask_dpe = offs_dpe < BLOCK_DMODEL + BLOCK_DPE
 
     q = tl.load(
         q_buffer
@@ -85,14 +86,17 @@ def _sparse_mla_compute_tile(
         mask=mask_h[:, None],
         other=0.0,
     )
-    qpe = tl.load(
-        q_buffer
-        + cur_q * stride_q_token
-        + cur_head[:, None] * stride_q_head
-        + offs_dpe[None, :],
-        mask=(mask_h[:, None]) & (mask_dpe[None, :]),
-        other=0.0,
-    )
+    if BLOCK_DPE > 0:
+        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+        mask_dpe = offs_dpe < BLOCK_DMODEL + BLOCK_DPE
+        qpe = tl.load(
+            q_buffer
+            + cur_q * stride_q_token
+            + cur_head[:, None] * stride_q_head
+            + offs_dpe[None, :],
+            mask=(mask_h[:, None]) & (mask_dpe[None, :]),
+            other=0.0,
+        )
 
     # Finite sentinel (not -inf) — when an entire BLOCK_N tile is masked,
     # `-inf - -inf = NaN` poisons the softmax; `sentinel - sentinel = 0`
@@ -123,17 +127,18 @@ def _sparse_mla_compute_tile(
         k = tl.load(k_buffer + offs_k, mask=mask_kv[None, :], other=0.0)
         qk = tl.dot(q, k.to(q.dtype))
 
-        offs_kpe = (
-            indices[None, :] * stride_kv_token
-            + cur_kv_head_id * stride_kv_head
-            + offs_dpe[:, None]
-        )
-        kpe = tl.load(
-            k_buffer + offs_kpe,
-            mask=(mask_kv[None, :]) & (mask_dpe[:, None]),
-            other=0.0,
-        )
-        qk += tl.dot(qpe, kpe.to(q.dtype))
+        if BLOCK_DPE > 0:
+            offs_kpe = (
+                indices[None, :] * stride_kv_token
+                + cur_kv_head_id * stride_kv_head
+                + offs_dpe[:, None]
+            )
+            kpe = tl.load(
+                k_buffer + offs_kpe,
+                mask=(mask_kv[None, :]) & (mask_dpe[:, None]),
+                other=0.0,
+            )
+            qk += tl.dot(qpe, kpe.to(q.dtype))
 
         qk *= sm_scale
         qk = tl.where((mask_h[:, None]) & (mask_kv[None, :]), qk, NEG_LARGE)
@@ -446,11 +451,14 @@ def triton_mla_sparse_attention(
 
     """
     num_tokens, num_heads_q, dim_qk = q.shape
-    assert dim_qk == _DIM_QK, (
-        f"sparse MLA kernel requires dim_qk={_DIM_QK} (DeepSeek-V3.2 / GLM-5), "
-        f"got {dim_qk}"
+    assert dim_qk in _SUPPORTED_DIM_QK, (
+        f"sparse MLA kernel requires dim_qk in {_SUPPORTED_DIM_QK} "
+        f"(V3.2/GLM-5.1 with RoPE, NoPE-only GLM-5.3), got {dim_qk}"
     )
-    assert kv.shape[1] == 1 and kv.shape[2] == _DIM_QK
+    assert kv.shape[1] == 1 and kv.shape[2] == dim_qk
+    # V is read from the leading BLOCK_DV lanes of each KV row.
+    assert dim_qk >= _BLOCK_DV
+    block_dpe = dim_qk - _BLOCK_DMODEL
     index_topk = indices.shape[2]
     assert index_topk % _MIN_BLOCK_N == 0, (
         f"topk ({index_topk}) must be a multiple of the smallest autotune "
@@ -495,7 +503,7 @@ def triton_mla_sparse_attention(
             BLOCK_H=_BLOCK_H,
             BLOCK_DV=_BLOCK_DV,
             BLOCK_DMODEL=_BLOCK_DMODEL,
-            BLOCK_DPE=_BLOCK_DPE,
+            BLOCK_DPE=block_dpe,
         )
         return out
 
@@ -528,7 +536,7 @@ def triton_mla_sparse_attention(
         BLOCK_H=_BLOCK_H,
         BLOCK_DV=_BLOCK_DV,
         BLOCK_DMODEL=_BLOCK_DMODEL,
-        BLOCK_DPE=_BLOCK_DPE,
+        BLOCK_DPE=block_dpe,
         LOGE2=LOGE2,
     )
 

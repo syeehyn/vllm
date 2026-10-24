@@ -11,6 +11,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.v1.attention.ops.triton_mla_sparse_kernel import (
+    _BLOCK_DV,
     _DIM_QK,
     triton_mla_sparse_attention,
 )
@@ -120,3 +121,51 @@ def test_short_prefill_no_nan(num_kv_splits, kv_cache, dtype):
     assert out.dtype == dtype
     assert not torch.isnan(out).any()
     assert not torch.isinf(out).any()
+
+
+def _sparse_mla_ref(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+) -> torch.Tensor:
+    """Dense torch reference over the selected KV rows (V = leading lanes)."""
+    num_tokens, num_heads, _ = q.shape
+    out = torch.empty(
+        (num_tokens, num_heads, _BLOCK_DV), dtype=torch.float32, device=q.device
+    )
+    v = kv[:, 0, :_BLOCK_DV].float()
+    for t in range(num_tokens):
+        idx = indices[t, 0]
+        idx = idx[(idx >= 0) & (idx < kv.shape[0])]
+        scores = (q[t].float() @ kv[idx, 0].float().T) * sm_scale
+        out[t] = torch.softmax(scores, dim=-1) @ v[idx]
+    return out
+
+
+@pytest.mark.parametrize("dim_qk", [_BLOCK_DV, _DIM_QK])
+@pytest.mark.parametrize("num_kv_splits", [1, 4])
+def test_matches_torch_reference(dim_qk, num_kv_splits):
+    """Sparse MLA must match softmax over the selected rows for both shapes.
+
+    ``dim_qk=_BLOCK_DV`` is the NoPE-only GLM-5.3 attention (no rope lanes);
+    ``_DIM_QK`` is V3.2 / GLM-5.1. Split-KV must agree as well.
+    """
+    torch.manual_seed(0)
+    seq_kv, num_tokens, num_heads, topk = 4096, 4, 32, 512
+    kv = torch.randn(seq_kv, 1, dim_qk, dtype=torch.bfloat16, device="cuda")
+    q = torch.randn(num_tokens, num_heads, dim_qk, dtype=torch.bfloat16, device="cuda")
+    indices = torch.randint(
+        0, seq_kv, (num_tokens, 1, topk), dtype=torch.int32, device="cuda"
+    )
+    indices[0, 0, :8] = -1  # masked slots, as the indexer emits for short rows
+
+    out = triton_mla_sparse_attention(
+        q, kv, indices, sm_scale=0.1, num_kv_splits=num_kv_splits
+    )
+    torch.testing.assert_close(
+        out.float(),
+        _sparse_mla_ref(q, kv, indices, sm_scale=0.1),
+        atol=3e-2,
+        rtol=3e-2,
+    )

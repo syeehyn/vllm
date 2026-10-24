@@ -9,13 +9,6 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.platforms import current_platform
 
 
-def _require_deep_gemm() -> None:
-    from vllm.utils.deep_gemm import has_deep_gemm
-
-    if not has_deep_gemm():
-        pytest.skip("kpool indexer requires DeepGEMM")
-
-
 def _build(indexer_cls, backend: str):
     cfg = VllmConfig(kernel_config={"sparse_indexer_topk_backend": backend})
     with set_current_vllm_config(cfg):
@@ -37,7 +30,6 @@ def test_kpool_indexer_dispatches_through_shared_topk_backend(backend: str) -> N
     """The kpool indexer must read kernel_config.sparse_indexer_topk_backend
     and hand it to the shared SparseIndexerTopk dispatcher, rather than
     hard-coding its own cooperative/persistent/per_row choice."""
-    _require_deep_gemm()
     from vllm.models.glm5next.nvidia.sparse_indexer import SparseAttnIndexerKpool
 
     assert _build(SparseAttnIndexerKpool, backend).topk_backend == backend
