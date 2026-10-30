@@ -170,6 +170,7 @@ if TYPE_CHECKING:
     VLLM_MLA_DISABLE: bool = False
     VLLM_DSV41_AMPERE_FUSED_DECODE: bool = True
     VLLM_DSV41_AMPERE_KV_MXFP8: bool = False
+    VLLM_SM80_TRITON_HC_PRENORM: bool = True
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1476,6 +1477,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # one. Changes page sizes; the two records' caches are not interchangeable.
     "VLLM_DSV41_AMPERE_KV_MXFP8": lambda: bool(
         int(os.getenv("VLLM_DSV41_AMPERE_KV_MXFP8", "0"))
+    ),
+    # SM8x mHC: split-K 3xTF32 tensor-core prenorm GEMM instead of the
+    # per-token TileLang kernel (DeepGEMM's TF32 kernel is SM90+).
+    "VLLM_SM80_TRITON_HC_PRENORM": lambda: bool(
+        int(os.getenv("VLLM_SM80_TRITON_HC_PRENORM", "1"))
     ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,

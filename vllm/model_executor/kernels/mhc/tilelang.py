@@ -6,6 +6,25 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
+def _use_triton_hc_prenorm(input_size: int, num_tokens: int) -> bool:
+    """SM8x has no DeepGEMM; its split-K tensor-core prenorm beats TileLang 2-4x."""
+    import vllm.envs as envs
+    from vllm.model_executor.kernels.mhc.triton_prenorm import (
+        supports_triton_hc_prenorm,
+    )
+    from vllm.model_executor.kernels.mhc.warmup import compute_mhc_pre_num_splits
+    from vllm.platforms import current_platform
+
+    return (
+        envs.VLLM_SM80_TRITON_HC_PRENORM
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability_family(80)
+        and supports_triton_hc_prenorm(
+            input_size, compute_mhc_pre_num_splits(input_size, num_tokens)
+        )
+    )
+
+
 def _hc_prenorm_gemm_outputs(
     x: torch.Tensor,
     fn: torch.Tensor,
@@ -24,9 +43,17 @@ def _hc_prenorm_gemm_outputs(
 
     use_deep_gemm = is_deep_gemm_supported() or not use_tilelang_fallback
     num_tokens = x.shape[0]
-    n_splits = (
-        compute_num_split(64, x.shape[1], cdiv(num_tokens, 64)) if use_deep_gemm else 1
-    )
+    use_triton = not use_deep_gemm and _use_triton_hc_prenorm(x.shape[1], num_tokens)
+    if use_triton:
+        from vllm.model_executor.kernels.mhc.warmup import compute_mhc_pre_num_splits
+
+        n_splits = compute_mhc_pre_num_splits(x.shape[1], num_tokens)
+    else:
+        n_splits = (
+            compute_num_split(64, x.shape[1], cdiv(num_tokens, 64))
+            if use_deep_gemm
+            else 1
+        )
     out = torch.empty(
         n_splits,
         num_tokens,
@@ -42,6 +69,12 @@ def _hc_prenorm_gemm_outputs(
     )
     if use_deep_gemm:
         tf32_hc_prenorm_gemm(x, fn, out, sqrsum, n_splits)
+    elif use_triton:
+        from vllm.model_executor.kernels.mhc.triton_prenorm import (
+            triton_hc_prenorm_gemm,
+        )
+
+        triton_hc_prenorm_gemm(x, fn, out, sqrsum, n_splits)
     else:
         from vllm.model_executor.kernels.mhc.tilelang_kernels import (
             _HC_PRENORM_GEMM_TILELANG_KERNEL,
@@ -147,8 +180,11 @@ def mhc_pre_delayed_tilelang(
         return outputs
 
     use_deep_gemm = is_deep_gemm_supported()
+    use_triton = not use_deep_gemm and _use_triton_hc_prenorm(input_size, num_tokens)
     n_splits = (
-        compute_mhc_pre_num_splits(input_size, num_tokens) if use_deep_gemm else 1
+        compute_mhc_pre_num_splits(input_size, num_tokens)
+        if use_deep_gemm or use_triton
+        else 1
     )
     mixes = torch.empty(
         n_splits, num_tokens, mix_size, dtype=torch.float32, device=residual.device
@@ -158,6 +194,12 @@ def mhc_pre_delayed_tilelang(
     )
     if use_deep_gemm:
         tf32_hc_prenorm_gemm(x, fn, mixes, sqrsum, n_splits)
+    elif use_triton:
+        from vllm.model_executor.kernels.mhc.triton_prenorm import (
+            triton_hc_prenorm_gemm,
+        )
+
+        triton_hc_prenorm_gemm(x, fn, mixes, sqrsum, n_splits)
     else:
         _HC_PRENORM_GEMM_TILELANG_KERNEL(
             x,
@@ -396,8 +438,13 @@ def mhc_fused_post_pre_delayed_tilelang(
         # The delayed epilogue is compiled per bucketed split count, so the
         # projection has to use the same bucket rather than the raw estimate.
         use_deep_gemm = is_deep_gemm_supported()
+        use_triton = not use_deep_gemm and _use_triton_hc_prenorm(
+            input_size, num_tokens
+        )
         n_splits = (
-            compute_mhc_pre_num_splits(input_size, num_tokens) if use_deep_gemm else 1
+            compute_mhc_pre_num_splits(input_size, num_tokens)
+            if use_deep_gemm or use_triton
+            else 1
         )
         mixes = torch.empty(
             n_splits, num_tokens, mix_size, dtype=torch.float32, device=residual.device
@@ -408,6 +455,12 @@ def mhc_fused_post_pre_delayed_tilelang(
         residual_cur_2d = residual_cur.view(num_tokens, input_size)
         if use_deep_gemm:
             tf32_hc_prenorm_gemm(residual_cur_2d, fn, mixes, sqrsum, n_splits)
+        elif use_triton:
+            from vllm.model_executor.kernels.mhc.triton_prenorm import (
+                triton_hc_prenorm_gemm,
+            )
+
+            triton_hc_prenorm_gemm(residual_cur_2d, fn, mixes, sqrsum, n_splits)
         else:
             _HC_PRENORM_GEMM_TILELANG_KERNEL(
                 residual_cur_2d,
