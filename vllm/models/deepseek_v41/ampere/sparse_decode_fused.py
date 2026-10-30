@@ -69,13 +69,13 @@ def _e4m3x4_to_bf16(u):
 
 
 @triton.jit
-def _record_ptrs(base_ptr, slot, CB: tl.constexpr, block_stride):
+def _record_ptrs(base_ptr, slot, cb, block_stride):
     """Byte pointers to the token data and the scale row of `slot` (masked slots -> 0)."""
     s = tl.where(slot >= 0, slot, 0).to(tl.int64)  # int64: blk * block_stride overflows int32
-    blk = s // CB
-    pos = s % CB
+    blk = s // cb
+    pos = s % cb
     rec = base_ptr + blk * block_stride + pos * 576
-    sc = base_ptr + blk * block_stride + CB * 576 + pos * 8
+    sc = base_ptr + blk * block_stride + cb * 576 + pos * 8
     return rec, sc
 
 
@@ -150,15 +150,17 @@ def _fused_split_kernel(
     start = cur_s * per_split
     for n0 in range(start, tl.minimum(start + per_split, TOTAL), BLOCK_N):
         offs_n = n0 + tl.arange(0, BLOCK_N)
-        # W_SWA is a multiple of BLOCK_N, so a tile is entirely SWA or entirely compressed;
-        # only the index load and pointer math branch, the record loads are shared.
-        if n0 < W_SWA:
-            slot = tl.load(swa_idx_ptr + cur_t * stride_swa_idx + offs_n, mask=offs_n < W_SWA, other=-1)
-            rec, sc = _record_ptrs(swa_ptr, slot, SWA_CB, swa_stride)
-        else:
-            j = offs_n - W_SWA
-            slot = tl.load(cmp_idx_ptr + cur_t * stride_cmp_idx + j, mask=j < W_CMP, other=-1)
-            rec, sc = _record_ptrs(cmp_ptr, slot, CMP_CB, cmp_stride)
+        # W_SWA is a multiple of BLOCK_N, so a tile is entirely SWA or entirely compressed.
+        # Select the source with tl.where rather than an scf.if: with the record loads after
+        # a branch, Triton's pipeliner (num_stages >= 2) miscompiled the SWA-only
+        # specialization into an illegal address on A100.
+        is_swa = n0 < W_SWA
+        j = offs_n - W_SWA
+        idx_ptrs = tl.where(is_swa, swa_idx_ptr + cur_t * stride_swa_idx + offs_n, cmp_idx_ptr + cur_t * stride_cmp_idx + j)
+        in_list = tl.where(is_swa, offs_n < W_SWA, (j >= 0) & (j < W_CMP))
+        slot = tl.load(idx_ptrs, mask=in_list, other=-1)
+        rec, sc = _record_ptrs(tl.where(is_swa, swa_ptr, cmp_ptr), slot, tl.where(is_swa, SWA_CB, CMP_CB),
+                               tl.where(is_swa, swa_stride, cmp_stride))
         valid = slot >= 0
         kn = _decode_nope(rec, sc, valid, BLOCK_N)
         if MERGED:
@@ -247,7 +249,7 @@ def fused_sparse_decode(
     attn_sink: torch.Tensor | None,  # [H] fp32
     out: torch.Tensor,  # [T, H, 512]
     num_warps: int = 4,
-    num_stages: int = 2,
+    num_stages: int = 3,  # best or within 4% of best at T 64..1024 on A100-40GB (v3e sweep)
     block_n: int = _BLOCK_N,
     merged: bool = True,
     direct: bool = True,
