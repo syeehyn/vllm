@@ -169,7 +169,7 @@ if TYPE_CHECKING:
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
     VLLM_DSV41_AMPERE_FUSED_DECODE: bool = True
-    VLLM_DSV41_AMPERE_KV_MXFP8: bool = False
+    VLLM_DSV41_AMPERE_KV_MXFP8: bool = True
     VLLM_SM80_TRITON_HC_PRENORM: bool = True
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
@@ -1473,10 +1473,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_DSV41_AMPERE_FUSED_DECODE", "1"))
     ),
     # DeepSeek V4.1 on SM8x: store the V4.1 528-byte KV record (512 fp8 e4m3
-    # dims incl. RoPE + 16 UE8M0 scales of 32 dims) instead of the V4 584-byte
-    # one. Changes page sizes; the two records' caches are not interchangeable.
+    # dims incl. RoPE + 16 UE8M0 scales of 32 dims), as DeepSeek's reference and
+    # SM100 do, instead of the V4 584-byte one (0). Changes page sizes; the two
+    # records' caches are not interchangeable.
     "VLLM_DSV41_AMPERE_KV_MXFP8": lambda: bool(
-        int(os.getenv("VLLM_DSV41_AMPERE_KV_MXFP8", "0"))
+        int(os.getenv("VLLM_DSV41_AMPERE_KV_MXFP8", "1"))
     ),
     # SM8x mHC: split-K 3xTF32 tensor-core prenorm GEMM instead of the
     # per-token TileLang kernel (DeepGEMM's TF32 kernel is SM90+).
