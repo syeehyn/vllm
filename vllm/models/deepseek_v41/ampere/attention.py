@@ -6,12 +6,15 @@ from typing import TYPE_CHECKING
 
 import torch
 
+import vllm.envs as envs
+
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 from vllm.models.deepseek_v41.ampere.o_proj import ampere_bf16_o_proj
 from vllm.models.deepseek_v41.ampere.sparse_attn import ampere_sparse_attn
 from vllm.models.deepseek_v41.ampere.sparse_decode import ampere_sparse_decode
+from vllm.models.deepseek_v41.ampere.sparse_decode_fused import fused_sparse_decode
 from vllm.models.deepseek_v41.common.ops import (
     compute_global_topk_indices_and_lens,
 )
@@ -102,7 +105,12 @@ class DeepseekV4AmpereAttention(DeepseekV4FlashMLAAttention):
                 swa_metadata.is_valid_token[:num_decode_tokens],
             )
 
-        ampere_sparse_decode(
+        decode = (
+            fused_sparse_decode
+            if envs.VLLM_DSV41_AMPERE_FUSED_DECODE
+            else ampere_sparse_decode
+        )
+        decode(
             q,
             self.swa_cache_layer.kv_cache,
             swa_metadata.decode_swa_indices,
