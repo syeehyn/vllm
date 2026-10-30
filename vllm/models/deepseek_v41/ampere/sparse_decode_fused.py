@@ -20,13 +20,18 @@ has a single split (large batches), the kernel normalizes with the attention sin
 and stores bf16 itself; otherwise the fork's log-sum-exp combine runs unchanged.
 `merged=False` / `direct=False` restore the separate-RoPE-dot and always-combine
 variants for A/B.
+
+The 528-byte V4.1 record (VLLM_DSV41_AMPERE_KV_MXFP8) is read the same way: all
+512 dims, RoPE included, are E4M3 with one UE8M0 scale per 32 dims, and each
+token's 16 scale bytes follow its own 512 data bytes.
 """
 
 import torch
 
 from vllm.triton_utils import LOG2E, tl, triton
 
-BYTES_PER_TOKEN = 584
+BYTES_PER_TOKEN = 584  # V4 record
+V41_BYTES_PER_TOKEN = 528  # V4.1 record: 512 e4m3 (RoPE included) + 16 UE8M0 scales of 32 dims
 FP8_DIM = 448
 ROPE_DIM = 64
 TOKEN_DATA = FP8_DIM + 2 * ROPE_DIM  # 576
@@ -69,13 +74,20 @@ def _e4m3x4_to_bf16(u):
 
 
 @triton.jit
-def _record_ptrs(base_ptr, slot, cb, block_stride):
-    """Byte pointers to the token data and the scale row of `slot` (masked slots -> 0)."""
+def _record_ptrs(base_ptr, slot, cb, block_stride, MX: tl.constexpr):
+    """Byte pointers to the token data and the scales of `slot` (masked slots -> 0)."""
     s = tl.where(slot >= 0, slot, 0).to(tl.int64)  # int64: blk * block_stride overflows int32
     blk = s // cb
     pos = s % cb
-    rec = base_ptr + blk * block_stride + pos * 576
-    sc = base_ptr + blk * block_stride + cb * 576 + pos * 8
+    page = base_ptr + blk * block_stride
+    if MX:
+        # V4.1: each token's 16 scale bytes follow its own 512 data bytes.
+        rec = page + pos * 528
+        sc = rec + 512
+    else:
+        # V4: 576-byte data rows, then the block's 8-byte scale rows.
+        rec = page + pos * 576
+        sc = page + cb * 576 + pos * 8
     return rec, sc
 
 
@@ -90,6 +102,19 @@ def _decode_nope(rec, sc, valid, BLOCK_N: tl.constexpr):
     e = tl.load(sc[:, None] + groups[None, :], mask=valid[:, None] & (groups[None, :] < 7), other=127)
     scale = tl.exp2(e.to(tl.float32) - 127.0)  # UE8M0: the byte is the fp32 exponent field
     scale_full = tl.reshape(tl.broadcast_to(scale[:, :, None], (BLOCK_N, 8, 64)), (BLOCK_N, 512))
+    return (x.to(tl.float32) * scale_full).to(tl.bfloat16)
+
+
+@triton.jit
+def _decode_mx(rec, sc, valid, BLOCK_N: tl.constexpr):
+    """[BLOCK_N, 512] bf16: all 512 dims (RoPE included) of 528-byte V4.1 records."""
+    cols = tl.arange(0, 512)
+    raw = tl.load(rec[:, None] + cols[None, :], mask=valid[:, None], other=0)
+    x = _e4m3x4_to_bf16(raw)
+    groups = tl.arange(0, 16)
+    e = tl.load(sc[:, None] + groups[None, :], mask=valid[:, None], other=127)
+    scale = tl.exp2(e.to(tl.float32) - 127.0)  # UE8M0: a power of two, so the product is exact in bf16
+    scale_full = tl.reshape(tl.broadcast_to(scale[:, :, None], (BLOCK_N, 16, 32)), (BLOCK_N, 512))
     return (x.to(tl.float32) * scale_full).to(tl.bfloat16)
 
 
@@ -122,6 +147,7 @@ def _fused_split_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     MERGED: tl.constexpr,  # RoPE in cols 448..511 of one [BLOCK_N, 512] tile: 2 dots per tile instead of 4
+    MX: tl.constexpr,  # 528-byte V4.1 record (requires MERGED)
     DIRECT: tl.constexpr,  # single split: normalize (with the sink) and store bf16 here, no combine pass
     HAS_SINK: tl.constexpr,
 ):
@@ -160,15 +186,19 @@ def _fused_split_kernel(
         in_list = tl.where(is_swa, offs_n < W_SWA, (j >= 0) & (j < W_CMP))
         slot = tl.load(idx_ptrs, mask=in_list, other=-1)
         rec, sc = _record_ptrs(tl.where(is_swa, swa_ptr, cmp_ptr), slot, tl.where(is_swa, SWA_CB, CMP_CB),
-                               tl.where(is_swa, swa_stride, cmp_stride))
+                               tl.where(is_swa, swa_stride, cmp_stride), MX)
         valid = slot >= 0
-        kn = _decode_nope(rec, sc, valid, BLOCK_N)
-        if MERGED:
-            kv = tl.where(d512[None, :] < 448, kn, _load_rope(rec, valid, True))
+        if MX:
+            kv = _decode_mx(rec, sc, valid, BLOCK_N)  # cols 448..511 are RoPE, as in q
             qk = tl.dot(q_nope, tl.trans(kv))
         else:
-            kr = _load_rope(rec, valid, False)
-            qk = tl.dot(q_nope, tl.trans(kn)) + tl.dot(q_rope, tl.trans(kr))
+            kn = _decode_nope(rec, sc, valid, BLOCK_N)
+            if MERGED:
+                kv = tl.where(d512[None, :] < 448, kn, _load_rope(rec, valid, True))
+                qk = tl.dot(q_nope, tl.trans(kv))
+            else:
+                kr = _load_rope(rec, valid, False)
+                qk = tl.dot(q_nope, tl.trans(kn)) + tl.dot(q_rope, tl.trans(kr))
         qk = qk * sm_scale
         qk = tl.where(mask_h[:, None] & valid[None, :], qk, -1.0e30)
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
@@ -256,7 +286,10 @@ def fused_sparse_decode(
 ) -> torch.Tensor:
     """Same contract as ampere_sparse_decode."""
     T, h_q, dim = q.shape
-    assert dim == HEAD_DIM and swa_cache.shape[-1] == BYTES_PER_TOKEN
+    rec_bytes = swa_cache.shape[-1]
+    assert dim == HEAD_DIM and rec_bytes in (BYTES_PER_TOKEN, V41_BYTES_PER_TOKEN)
+    mx = rec_bytes == V41_BYTES_PER_TOKEN
+    assert merged or not mx, "the 528-byte record has no separate BF16 RoPE tail"
     swa_idx = swa_indices.reshape(T, -1)
     if swa_idx.stride(-1) != 1:
         swa_idx = swa_idx.contiguous()
@@ -269,7 +302,7 @@ def fused_sparse_decode(
         if cmp_idx.stride(-1) != 1:
             cmp_idx = cmp_idx.contiguous()
         cmp = compressed_cache
-        assert cmp.shape[-1] == BYTES_PER_TOKEN
+        assert cmp.shape[-1] == rec_bytes  # one record for both caches (same gate)
     else:
         cmp_idx = swa_idx[:, :0]
         cmp = swa_cache
@@ -305,6 +338,7 @@ def fused_sparse_decode(
         BLOCK_H=block_h,
         BLOCK_N=block_n,
         MERGED=merged,
+        MX=mx,
         DIRECT=direct,
         HAS_SINK=attn_sink is not None,
         num_warps=num_warps,

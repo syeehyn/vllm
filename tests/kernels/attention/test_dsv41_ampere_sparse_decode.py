@@ -16,23 +16,28 @@ pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda(), reason="CUDA-only kernels"
 )
 
-BYTES_PER_TOKEN = 584
 HEAD_DIM = 512
 BLOCK_SIZE = 32
 
 
-def _build_cache(num_blocks, k_rows):
+# V4 (448 fp8 + 64 bf16 RoPE) and V4.1 (512 fp8, VLLM_DSV41_AMPERE_KV_MXFP8).
+@pytest.fixture(params=[584, 528], ids=["v4_584B", "v41_528B"])
+def record(request):
+    return request.param
+
+
+def _build_cache(num_blocks, k_rows, bytes_per_token):
     """Encode `k_rows` [n, 512] bf16 into a paged cache at slots 0..n-1."""
     from vllm.models.deepseek_v41.common.ops.cache_utils import (
         quantize_and_insert_k_cache,
     )
 
     cache = torch.zeros(
-        (num_blocks, BLOCK_SIZE, BYTES_PER_TOKEN), dtype=torch.uint8, device="cuda"
+        (num_blocks, BLOCK_SIZE, bytes_per_token), dtype=torch.uint8, device="cuda"
     )
     slots = torch.arange(k_rows.shape[0], dtype=torch.int64, device="cuda")
     quantize_and_insert_k_cache(
-        k_rows, cache, slots, block_size=BLOCK_SIZE, bytes_per_token=BYTES_PER_TOKEN
+        k_rows, cache, slots, block_size=BLOCK_SIZE, bytes_per_token=bytes_per_token
     )
     return cache
 
@@ -50,27 +55,30 @@ def _gather(cache, indices, total=None, col_offset=0, num_tokens=None):
     return out.view(num_tokens, total, HEAD_DIM)
 
 
-def test_gather_roundtrips_the_encoder():
+def test_gather_roundtrips_the_encoder(record):
     torch.manual_seed(0)
     n = 96
     k = torch.randn(n, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    cache = _build_cache(4, k)
+    cache = _build_cache(4, k, record)
 
     idx = torch.randperm(n, device="cuda")[:64].to(torch.int32).view(2, 32)
     got = _gather(cache, idx)
 
     want = k[idx.reshape(-1).long()].view(2, 32, HEAD_DIM)
-    # FP8 block quantization on the leading 448 dims; the 64 RoPE dims are BF16.
-    fp8_err = (got[..., :448].float() - want[..., :448].float()).abs().max()
-    assert fp8_err / want[..., :448].abs().max() < 0.1, fp8_err
-    torch.testing.assert_close(got[..., 448:], want[..., 448:], rtol=0, atol=0)
+    # FP8 block quantization on the leading 448 dims (all 512 in the V4.1
+    # record); the V4 record keeps the 64 RoPE dims in BF16.
+    fp8_dims = 448 if record == 584 else HEAD_DIM
+    fp8_err = (got[..., :fp8_dims].float() - want[..., :fp8_dims].float()).abs().max()
+    assert fp8_err / want[..., :fp8_dims].abs().max() < 0.1, fp8_err
+    if record == 584:
+        torch.testing.assert_close(got[..., 448:], want[..., 448:], rtol=0, atol=0)
 
 
-def test_padding_slots_are_zeroed_not_stale():
+def test_padding_slots_are_zeroed_not_stale(record):
     torch.manual_seed(0)
     n = 64
     k = torch.randn(n, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    cache = _build_cache(2, k)
+    cache = _build_cache(2, k, record)
 
     idx = torch.arange(32, dtype=torch.int32, device="cuda").view(1, 32)
     idx[0, 16:] = -1
@@ -79,12 +87,12 @@ def test_padding_slots_are_zeroed_not_stale():
     assert torch.count_nonzero(got[0, :16]) > 0
 
 
-def test_gather_writes_only_its_own_column_window():
+def test_gather_writes_only_its_own_column_window(record):
     """Two sources must interleave into the union buffer without overwriting."""
     torch.manual_seed(0)
     n = 64
     k = torch.randn(n, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    cache = _build_cache(2, k)
+    cache = _build_cache(2, k, record)
     from vllm.models.deepseek_v41.ampere.sparse_decode import _gather_dequant
 
     num_tokens, w_a, w_b = 2, 8, 4
@@ -109,13 +117,18 @@ def test_gather_writes_only_its_own_column_window():
     torch.testing.assert_close(view[:, w_a:], ref_b, rtol=0, atol=0)
 
 
-def test_decode_matches_a_dense_reference():
+@pytest.mark.parametrize("fused", [False, True], ids=["gather", "fused"])
+def test_decode_matches_a_dense_reference(record, fused):
     from vllm.models.deepseek_v41.ampere.sparse_decode import ampere_sparse_decode
+    from vllm.models.deepseek_v41.ampere.sparse_decode_fused import (
+        fused_sparse_decode,
+    )
 
+    decode = fused_sparse_decode if fused else ampere_sparse_decode
     torch.manual_seed(0)
     n, num_tokens, h_q = 96, 3, 64
     k = torch.randn(n, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    cache = _build_cache(4, k)
+    cache = _build_cache(4, k, record)
 
     q = torch.randn(num_tokens, h_q, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
     swa = torch.randint(0, n, (num_tokens, 16), dtype=torch.int32, device="cuda")
@@ -125,7 +138,7 @@ def test_decode_matches_a_dense_reference():
     sm_scale = HEAD_DIM**-0.5
 
     out = torch.zeros(num_tokens, h_q, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    ampere_sparse_decode(q, cache, swa, cache, comp, sm_scale, sink, out)
+    decode(q, cache, swa, cache, comp, sm_scale, sink, out)
 
     # Reference over exactly the rows the cache holds, so quantization cancels.
     rows = _gather(cache, torch.arange(n, dtype=torch.int32, device="cuda").view(1, n))
@@ -141,3 +154,53 @@ def test_decode_matches_a_dense_reference():
 
     rel = (out.float() - want).abs().max() / want.abs().max()
     assert rel < 2e-2, f"max rel err {rel:.3e}"
+
+
+@pytest.mark.parametrize("swa_only", [False, True])
+def test_fused_decode_matches_the_gather_path(record, swa_only):
+    """Same records, same indices: the fused kernel equals gather + split."""
+    from vllm.models.deepseek_v41.ampere.sparse_decode import ampere_sparse_decode
+    from vllm.models.deepseek_v41.ampere.sparse_decode_fused import (
+        fused_sparse_decode,
+    )
+
+    torch.manual_seed(1)
+    n, num_tokens, h_q = 128, 5, 8
+    k = torch.randn(n, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    cache = _build_cache(4, k, record)
+    q = torch.randn(num_tokens, h_q, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    swa = torch.randint(0, n, (num_tokens, 128), dtype=torch.int32, device="cuda")
+    comp = torch.randint(0, n, (num_tokens, 512), dtype=torch.int32, device="cuda")
+    swa[1, 40:] = -1
+    comp[1, 100:] = -1
+    swa[2] = -1  # nothing to attend to
+    comp[2] = -1
+    sink = torch.randn(h_q, dtype=torch.float32, device="cuda")
+    args = (None, None) if swa_only else (cache, comp)
+
+    want = torch.zeros(num_tokens, h_q, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    got = torch.full_like(want, float("nan"))
+    ampere_sparse_decode(q, cache, swa, *args, HEAD_DIM**-0.5, sink, want)
+    fused_sparse_decode(q, cache, swa, *args, HEAD_DIM**-0.5, sink, got)
+
+    assert torch.count_nonzero(got[2]) == 0
+    rel = (got.float() - want.float()).abs().amax(-1) / (
+        want.float().abs().amax(-1) + 1e-3
+    )
+    assert rel.max() < 2e-2, f"max row rel err {rel.max():.3e}"
+
+
+def test_fused_decode_rejects_split_rope_dots_on_the_v41_record():
+    from vllm.models.deepseek_v41.ampere.sparse_decode_fused import (
+        fused_sparse_decode,
+    )
+
+    k = torch.randn(32, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    cache = _build_cache(1, k, 528)
+    q = torch.randn(1, 8, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    swa = torch.arange(16, dtype=torch.int32, device="cuda").view(1, 16)
+    out = torch.empty_like(q)
+    with pytest.raises(AssertionError):
+        fused_sparse_decode(
+            q, cache, swa, None, None, HEAD_DIM**-0.5, None, out, merged=False
+        )

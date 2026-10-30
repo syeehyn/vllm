@@ -84,19 +84,24 @@ def test_ampere_keeps_natural_head_count():
     assert DeepseekV4AmpereAttention.get_padded_num_q_heads(64) == 64
 
 
-def test_v41_kv_record_is_the_v4_one_on_sm80(monkeypatch):
+@pytest.mark.parametrize(
+    "family, cuda, opt_in, want",
+    [
+        (80, True, False, False),  # SM80 default: the V4 584 B record
+        (80, True, True, True),  # VLLM_DSV41_AMPERE_KV_MXFP8=1
+        (90, True, True, False),  # the opt-in is SM8x only
+        (100, True, False, True),  # SM100 always reads the V4.1 record
+        (80, False, True, False),  # ROCm keeps 584 (its mono runner asserts it)
+    ],
+)
+def test_v41_kv_record_gate(monkeypatch, family, cuda, opt_in, want):
+    platform = dsv41_attention.current_platform
     monkeypatch.setattr(
-        dsv41_attention.current_platform,
-        "is_device_capability_family",
-        staticmethod(lambda major: False),
+        platform, "is_device_capability_family", staticmethod(lambda m: m == family)
     )
-    assert dsv41_attention._use_v41_mxfp8_kv_record() is False
-    monkeypatch.setattr(
-        dsv41_attention.current_platform,
-        "is_device_capability_family",
-        staticmethod(lambda major: major == 100),
-    )
-    assert dsv41_attention._use_v41_mxfp8_kv_record() is True
+    monkeypatch.setattr(platform, "is_cuda", staticmethod(lambda: cuda))
+    monkeypatch.setattr(dsv41_attention.envs, "VLLM_DSV41_AMPERE_KV_MXFP8", opt_in)
+    assert dsv41_attention._use_v41_mxfp8_kv_record() is want
 
 
 def test_tile_scheduler_skipped_without_flashmla(monkeypatch):

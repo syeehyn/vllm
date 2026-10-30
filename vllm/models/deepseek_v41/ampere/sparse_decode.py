@@ -34,6 +34,29 @@ _V4_SCALE_DIM = 8
 _V4_QUANT_BLOCK = 64
 _V4_TOKEN_DATA_SIZE = _V4_FP8_DIM + _V4_BF16_DIM * 2  # 576
 _HEAD_DIM = 512
+# The V4.1 record (VLLM_DSV41_AMPERE_KV_MXFP8): all 512 dims, RoPE included, as
+# fp8 with one UE8M0 scale per 32 dims, each token's 16 scales after its data.
+_V41_BYTES_PER_TOKEN = 528
+_RECORD_LAYOUTS = {
+    _V4_BYTES_PER_TOKEN: dict(
+        TOKEN_DATA_SIZE=_V4_TOKEN_DATA_SIZE,
+        FP8_DIM=_V4_FP8_DIM,
+        BF16_DIM=_V4_BF16_DIM,
+        SCALE_DIM=_V4_SCALE_DIM,
+        QUANT_BLOCK=_V4_QUANT_BLOCK,
+        N_QUANT_BLOCKS=_V4_SCALE_DIM,
+        INTERLEAVED=False,
+    ),
+    _V41_BYTES_PER_TOKEN: dict(
+        TOKEN_DATA_SIZE=_V41_BYTES_PER_TOKEN,
+        FP8_DIM=_HEAD_DIM,
+        BF16_DIM=0,
+        SCALE_DIM=16,
+        QUANT_BLOCK=32,
+        N_QUANT_BLOCKS=16,
+        INTERLEAVED=True,
+    ),
+}
 
 
 @triton.jit(do_not_specialize=["num_rows"])
@@ -55,6 +78,7 @@ def _gather_dequant_slots_kernel(
     HEAD_DIM: tl.constexpr,
     N_QUANT_BLOCKS: tl.constexpr,
     NATIVE_FP8: tl.constexpr,
+    INTERLEAVED: tl.constexpr,
 ):
     """Dequantize the paged rows named by `indices` into a dense BF16 buffer.
 
@@ -80,11 +104,15 @@ def _gather_dequant_slots_kernel(
         # caches, the same wrap the paged MQA-logits kernel hit.
         cache_block_ptr = cache_ptr + block_idx * block_stride
         token_data_ptr = cache_block_ptr + pos_in_block * TOKEN_DATA_SIZE
-        token_scale_ptr = (
-            cache_block_ptr
-            + CACHE_BLOCK_SIZE * TOKEN_DATA_SIZE
-            + pos_in_block * SCALE_DIM
-        )
+        if INTERLEAVED:
+            # V4.1: each token's scales follow its own data bytes.
+            token_scale_ptr = token_data_ptr + FP8_DIM
+        else:
+            token_scale_ptr = (
+                cache_block_ptr
+                + CACHE_BLOCK_SIZE * TOKEN_DATA_SIZE
+                + pos_in_block * SCALE_DIM
+            )
 
         for qblock_idx in tl.static_range(N_QUANT_BLOCKS):
             qblock_start = qblock_idx * QUANT_BLOCK
@@ -112,12 +140,11 @@ def _gather_dequant(
     col_offset: int,
 ) -> None:
     """Scatter-dequantize `indices` [tokens, width] into `out` [., 512] BF16."""
-    bytes_per_token = cache.shape[-1]
-    if bytes_per_token != _V4_BYTES_PER_TOKEN:
+    layout = _RECORD_LAYOUTS.get(cache.shape[-1])
+    if layout is None:
         raise NotImplementedError(
-            f"DeepSeek V4.1 Ampere decode expects the {_V4_BYTES_PER_TOKEN}-byte "
-            f"KV record, got {bytes_per_token}. The 528-byte MXFP8 record is "
-            "selected only on SM100."
+            "DeepSeek V4.1 Ampere decode reads the 584- or 528-byte KV record, "
+            f"got {cache.shape[-1]} bytes."
         )
     num_rows = indices.numel()
     if num_rows == 0:
@@ -132,14 +159,9 @@ def _gather_dequant(
         TOTAL=total,
         COL_OFFSET=col_offset,
         CACHE_BLOCK_SIZE=cache.shape[1],
-        TOKEN_DATA_SIZE=_V4_TOKEN_DATA_SIZE,
-        FP8_DIM=_V4_FP8_DIM,
-        BF16_DIM=_V4_BF16_DIM,
-        SCALE_DIM=_V4_SCALE_DIM,
-        QUANT_BLOCK=_V4_QUANT_BLOCK,
         HEAD_DIM=_HEAD_DIM,
-        N_QUANT_BLOCKS=_V4_SCALE_DIM,
         NATIVE_FP8=has_native_fp8e4nv(),
+        **layout,
         num_warps=4,
         **({} if has_native_fp8e4nv() else {"extern_libs": FP8E4NV_EXTERN_LIBS}),
     )

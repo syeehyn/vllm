@@ -131,11 +131,19 @@ def _fill_short_context_topk_indices(
 # Which packed fp8_ds_mla record a V4.1 layer writes. FlashMLA decodes
 # DeepSeek's V4.1 record -- all 512 dims (RoPE included) as fp8 e4m3 with one
 # UE8M0 scale per 32 dims, each token's 512 data bytes followed by its 16 scale
-# bytes -- only in its SM100 sparse-decode kernels. Every other arch keeps the
+# bytes -- only in its SM100 sparse-decode kernels. SM8x opts in with
+# VLLM_DSV41_AMPERE_KV_MXFP8: its writers and prefill gather are record-generic
+# and both Ampere decode kernels read either record. Every other arch keeps the
 # V4 record: 448 fp8 NoPE + 64 bf16 RoPE plus 7 UE8M0 scales of 64 dims and a
 # pad byte (584 B, 576 B pages).
 def _use_v41_mxfp8_kv_record() -> bool:
-    return current_platform.is_device_capability_family(100)
+    if current_platform.is_device_capability_family(100):
+        return True
+    return bool(
+        envs.VLLM_DSV41_AMPERE_KV_MXFP8
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability_family(80)
+    )
 
 
 def _resolve_dsv4_kv_cache_dtype(
@@ -554,11 +562,21 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # sum. V4 needs its 576 B TMA stride; V4.1's is on the SWA block
         # stride, and 512 is free (its pages are already 512 B multiples).
         self.kv_page_alignment = 512 if self.kv_mxfp8 else 576
-        if self.kv_cache_dtype == "nvfp4_ds_mla" and not self.kv_mxfp8:
+        # The 288 B NVFP4 writer and reader need native fp8 (tl.float8e4nv), so
+        # SM8x's opt-in to the V4.1 record does not extend to it.
+        if (
+            self.kv_cache_dtype == "nvfp4_ds_mla"
+            and not current_platform.is_device_capability_family(100)
+        ):
             raise ValueError(
-                "nvfp4_ds_mla needs the V4.1 KV records, which FlashMLA "
-                "decodes only on SM100."
+                "nvfp4_ds_mla needs the V4.1 KV records with an NVFP4 compressed "
+                "cache, which FlashMLA decodes only on SM100."
             )
+        logger.info_once(
+            "DeepSeek V4.1 KV record: %d B/token SWA, %d B/token compressed",
+            self.swa_bytes_per_token,
+            self.compressed_bytes_per_token,
+        )
 
         swa_bounded_replay = cache_config.swa_bounded_replay
         if swa_bounded_replay and not vllm_config.use_v2_model_runner:

@@ -105,6 +105,9 @@ class DeepseekV4AmpereAttention(DeepseekV4FlashMLAAttention):
                 swa_metadata.is_valid_token[:num_decode_tokens],
             )
 
+        # The SWA writer's host wrapper does not check the row width against
+        # kv_mxfp8, so a mismatched record would decode as garbage.
+        assert self.swa_cache_layer.kv_cache.shape[-1] == self.swa_bytes_per_token
         decode = (
             fused_sparse_decode
             if envs.VLLM_DSV41_AMPERE_FUSED_DECODE

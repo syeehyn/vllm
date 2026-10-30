@@ -169,6 +169,7 @@ if TYPE_CHECKING:
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
     VLLM_DSV41_AMPERE_FUSED_DECODE: bool = True
+    VLLM_DSV41_AMPERE_KV_MXFP8: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1469,6 +1470,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to fall back to the gather path.
     "VLLM_DSV41_AMPERE_FUSED_DECODE": lambda: bool(
         int(os.getenv("VLLM_DSV41_AMPERE_FUSED_DECODE", "1"))
+    ),
+    # DeepSeek V4.1 on SM8x: store the V4.1 528-byte KV record (512 fp8 e4m3
+    # dims incl. RoPE + 16 UE8M0 scales of 32 dims) instead of the V4 584-byte
+    # one. Changes page sizes; the two records' caches are not interchangeable.
+    "VLLM_DSV41_AMPERE_KV_MXFP8": lambda: bool(
+        int(os.getenv("VLLM_DSV41_AMPERE_KV_MXFP8", "0"))
     ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
