@@ -475,8 +475,13 @@ def test_sharded_candidate_rows_match_replicated(
         ]
     # One exchange for the top-k, one more for the source's candidate blocks.
     assert len(tp.sent) == 1 + candidate_write
+    # The CUDA top-k writes a row's indices in no fixed order (two replicated
+    # runs differ too), so compare each row's set.
+    ref_sorted = ref_topk[:rows].sort(dim=1).values
     for topk, cands in outputs:
-        torch.testing.assert_close(topk[:rows], ref_topk[:rows], rtol=0, atol=0)
+        torch.testing.assert_close(
+            topk[:rows].sort(dim=1).values, ref_sorted, rtol=0, atol=0
+        )
         torch.testing.assert_close(cands[:rows], ref_candidates[:rows], rtol=0, atol=0)
         # Decode rows: the top-k clear's -1 and the candidates' sentinel.
         assert (topk[:decode] == -1).all() and (cands[:decode] == -7).all()
