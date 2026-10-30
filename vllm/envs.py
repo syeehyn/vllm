@@ -182,7 +182,7 @@ if TYPE_CHECKING:
     VLLM_DP_MASTER_IP: str = ""
     VLLM_DP_MASTER_PORT: int = 0
     VLLM_RANDOMIZE_DP_DUMMY_INPUTS: bool = False
-    VLLM_RAY_DP_PACK_STRATEGY: Literal["strict", "fill", "span"] = "strict"
+    VLLM_RAY_DP_PACK_STRATEGY: Literal["strict", "fill", "span", "stripe"] = "strict"
     VLLM_RAY_DP_PLACEMENT_NODE_IPS: str = ""
     VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY: str = ""
     VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
@@ -1518,6 +1518,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - "span":
     #   Should be used only when a single DP rank requires multiple nodes.
     #   allocate one DP rank over as many nodes as required for set world_size;
+    # - "stripe":
+    #   one pipeline stage per node, shared by all DP ranks, so each EP group
+    #   (same PP rank) stays inside one node. Needs DP*TP GPUs per node.
     # This environment variable is ignored if data-parallel-backend is not Ray.
     "VLLM_RAY_DP_PACK_STRATEGY": lambda: os.getenv(
         "VLLM_RAY_DP_PACK_STRATEGY", "strict"

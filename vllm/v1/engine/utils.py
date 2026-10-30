@@ -699,12 +699,17 @@ class CoreEngineActorManager:
         max_device_per_node = max(n_node_devices)
 
         pack_strategy = envs.VLLM_RAY_DP_PACK_STRATEGY
-        _supported_pack_strategies = ("strict", "fill", "span")
+        _supported_pack_strategies = ("strict", "fill", "span", "stripe")
         if pack_strategy not in _supported_pack_strategies:
             raise ValueError(
                 f"{envs.VLLM_RAY_DP_PACK_STRATEGY} is not supported. "
                 "Make sure to set `VLLM_RAY_DP_PACK_STRATEGY` "
                 f"to one of {_supported_pack_strategies}"
+            )
+
+        if pack_strategy == "stripe":
+            return CoreEngineActorManager._create_striped_dp_placement_groups(
+                vllm_config, nodes, device_str, dp_master_ip
             )
 
         all2all_backend = vllm_config.parallel_config.all2all_backend
@@ -850,6 +855,63 @@ class CoreEngineActorManager:
             f"expected {dp_size}"
         )
         return placement_groups, local_dp_ranks
+
+    @staticmethod
+    def _create_striped_dp_placement_groups(
+        vllm_config: VllmConfig,
+        nodes: list[dict],
+        device_str: str,
+        dp_master_ip: str,
+    ) -> tuple[list["PlacementGroup"], list[int]]:
+        """One PP stage per node, shared by every DP rank (``stripe``).
+
+        Each DP rank's group is its TP ranks on stage 0's node, then its TP
+        ranks on stage 1's node, and so on, with the engine's control bundle
+        on the master. Ranks with the same PP rank -- the EP group -- then sit
+        on one node, so MoE all-to-all stays on NVLink and only pipeline
+        send/recv crosses nodes. strict/fill put a whole DP rank on one node
+        instead, which splits every EP group across nodes.
+        """
+        import ray
+
+        pc = vllm_config.parallel_config
+        tp, pp, dp_size = (
+            pc.tensor_parallel_size,
+            pc.pipeline_parallel_size,
+            pc.data_parallel_size,
+        )
+        assert pc.prefill_context_parallel_size == 1, "stripe assumes PCP=1"
+        assert pc.data_parallel_size_local == dp_size, (
+            "stripe runs every DP engine on the master node; leave "
+            "--data-parallel-size-local unset"
+        )
+        gpu_nodes = [n for n in nodes if int(n.get(device_str, 0)) > 0]
+        stage_ips = [_node_ip_from_resources(n) for n in gpu_nodes[:pp]]
+        assert len(stage_ips) == pp and stage_ips[0] == dp_master_ip, (
+            f"stripe needs {pp} GPU nodes with the DP master first, got {stage_ips}"
+        )
+        for n, ip in zip(gpu_nodes[:pp], stage_ips):
+            assert int(n[device_str]) >= dp_size * tp, (
+                f"stripe needs {dp_size * tp} {device_str}s on {ip}"
+            )
+        placement_groups = []
+        for d in range(dp_size):
+            bundles = [
+                {device_str: 1.0, "node:" + ip: 0.001} for ip in stage_ips for _ in range(tp)
+            ]
+            bundles.append(_make_control_bundle(dp_master_ip))
+            placement_groups.append(
+                ray.util.placement_group(
+                    name=f"dp_rank_{d}", strategy="PACK", bundles=bundles
+                )
+            )
+        logger.info(
+            "stripe: %d DP ranks x (TP %d per stage) over stage nodes %s",
+            dp_size,
+            tp,
+            stage_ips,
+        )
+        return placement_groups, list(range(dp_size))
 
     @staticmethod
     def add_dp_placement_groups(
