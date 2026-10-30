@@ -441,6 +441,32 @@ def _reserve_row_shard_exchange_transient(
     )
 
 
+def _log_candidate_row_shard_inert(vllm_config) -> None:
+    """Say once when VLLM_DSV41_INDEXER_SHARD_CANDIDATE_ROWS cannot take effect:
+    it only joins the candidate indexers to the existing row shard."""
+    parallel_config = vllm_config.parallel_config
+    min_rows = vllm_config.attention_config.indexer_tp_shard_min_rows
+    max_rows = vllm_config.scheduler_config.max_num_batched_tokens
+    if not tp_prefill_row_sharding_supported(
+        vllm_config,
+        parallel_config.decode_context_parallel_size,
+        parallel_config.prefill_context_parallel_size > 1,
+        parallel_config.tensor_parallel_size,
+    ):
+        reason = "indexer prefill row sharding is unavailable in this configuration"
+    elif min_rows > max_rows:
+        reason = (
+            f"a step's {max_rows} rows (max_num_batched_tokens) never reach "
+            f"attention_config.indexer_tp_shard_min_rows={min_rows}; lowering it "
+            "also row-shards every other indexer"
+        )
+    else:
+        return
+    logger.info_once(
+        "VLLM_DSV41_INDEXER_SHARD_CANDIDATE_ROWS has no effect: %s.", reason
+    )
+
+
 @eager_break_during_capture
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
@@ -548,6 +574,12 @@ def sparse_attn_indexer(
         # The dummy run returns before exchange_topk executes, so reserve its
         # worst-case transient for the memory profile.
         _reserve_row_shard_exchange_transient(topk_indices_buffer, hidden_states.device)
+        if candidate_write and envs.VLLM_DSV41_INDEXER_SHARD_CANDIDATE_ROWS:
+            # So does the candidate source's exchange of its candidate blocks.
+            assert candidate_blocks is not None
+            _reserve_row_shard_exchange_transient(
+                candidate_blocks, hidden_states.device
+            )
 
         return sparse_attn_indexer_fake(
             hidden_states,
@@ -682,10 +714,15 @@ def sparse_attn_indexer(
             scales_spec,
             *gather_specs,
         )
-        # One row window per rank; DSV4.1 candidate rows stay replicated.
+        # One row window per rank; DSV4.1 candidate rows stay replicated
+        # unless VLLM_DSV41_INDEXER_SHARD_CANDIDATE_ROWS.
+        replicate_rows = (
+            candidate_blocks is not None
+            and not envs.VLLM_DSV41_INDEXER_SHARD_CANDIDATE_ROWS
+        )
         row_shard = (
             None
-            if candidate_blocks is not None
+            if replicate_rows
             else PrefillRowShard.from_metadata(prefill_metadata, num_decode_tokens)
         )
         for chunk in prefill_metadata.chunks:
@@ -801,9 +838,7 @@ def sparse_attn_indexer(
                     # Two-level selection (v4.1): the candidate source
                     # publishes its top blocks; later indexers mask their
                     # scores to them. Both before the row top-k.
-                    chunk_candidates = candidate_blocks[
-                        chunk.token_start : chunk.token_end
-                    ]
+                    chunk_candidates = candidate_blocks[row_start:row_end]
                     if candidate_write:
                         _select_candidate_blocks(
                             logits,
@@ -850,6 +885,10 @@ def sparse_attn_indexer(
         if row_shard is not None:
             # Rows are already fully ranked, so this is a layout gather.
             row_shard.exchange_topk(topk_indices_buffer, topk_tokens)
+            if candidate_blocks is not None and candidate_write:
+                # Leave every row as the replicated path does; pipeline
+                # sharing ships them all to the next stage.
+                row_shard.exchange_topk(candidate_blocks, candidate_blocks.shape[1])
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
@@ -1144,6 +1183,11 @@ class SparseAttnIndexer(CustomOp):
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         self.pcp_shard_decode_requests = parallel_config.pcp_shard_decode_requests
         self._cp_kv_cache_interleave_size: int | None = None
+        if (
+            candidate_blocks is not None
+            and envs.VLLM_DSV41_INDEXER_SHARD_CANDIDATE_ROWS
+        ):
+            _log_candidate_row_shard_inert(vllm_config)
         if current_platform.is_cuda() and not is_deep_gemm_supported():
             logger.warning_once(
                 "DeepGEMM attention kernels are unavailable on this CUDA "

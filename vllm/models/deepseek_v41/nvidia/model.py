@@ -107,7 +107,11 @@ from ..common.engram import (
     gather_engram_hashes,
 )
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
-from ..common.pipeline import get_sharing_dependencies, validate_local_sharing
+from ..common.pipeline import (
+    decoder_replay_stage_reason,
+    get_sharing_dependencies,
+    validate_local_sharing,
+)
 from ..common.pipeline_sharing import PipelineSharing
 from .ops.mhc import (
     MHC_OVERLAP_MAX_TOKENS,
@@ -683,15 +687,34 @@ class DeepseekV4DecoderLayer(nn.Module):
         x: torch.Tensor | MoEOutput,
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
-        pre_mix: torch.Tensor,
-        post_mix: torch.Tensor,
-        res_mix: torch.Tensor,
-        residual: torch.Tensor,
+        pre_mix: torch.Tensor | None,
+        post_mix: torch.Tensor | None,
+        res_mix: torch.Tensor | None,
+        residual: torch.Tensor | None,
     ) -> None:
         """Write the KV ``forward`` would for the replay layers' inputs, skipping
         the rest of the layer; the replay batch then reruns its rows."""
         # The replay batch rules out Engram and sequence parallel here.
         assert self.engram is None and not self.use_sequence_parallel
+        if residual is None:
+            # First layer of a pipeline stage: x is the incoming hc stream.
+            assert isinstance(x, torch.Tensor) and x.dim() == 3
+            _, _, x, _ = mhc_pre_delayed_tilelang(
+                x,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                self.hc_post_alpha,
+                self.hc_sinkhorn_iters,
+                pre_mix=pre_mix,
+                norm_weight=self.attn_norm.weight,
+                norm_eps=self.attn_norm.variance_epsilon,
+            )
+            self.attn.forward_kv(positions, x)
+            return
         *_, x, _, _ = mhc_shifted_post_pre(
             x,
             residual,
@@ -902,11 +925,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.decoder_replay_layers: DecoderReplayLayers | None = None
         self.decoder_replay_start = self.end_layer
         cut = max(config.kv_source_layer_ids)
-        if (
-            cut < self.end_layer - 1
-            and self._decoder_replay_supported(vllm_config, cut)
-            and self.layers[cut].attn.swa_cache_layer.bounded_replay
-        ):
+        if self._decoder_replay_enabled(vllm_config, cut):
             assert self.layers[cut].attn.compress_ratio <= 1
             # The last KV source writes every row's KV, then replays.
             self.decoder_replay_start = cut
@@ -1137,45 +1156,21 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         ):
             input_ids = get_pcp_group().all_gather(input_ids, dim=0)
 
-        residual, post_mix, res_mix = None, None, None
         pre_mix: torch.Tensor | None = None
         if not get_pp_group().is_first_rank:
             assert intermediate_tensors is not None
             pre_mix = intermediate_tensors["pre_mix"]
         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
-        hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
-            range(self.start_layer, self.decoder_replay_start),
+        hidden_states, pre_mix, late_aux = self._run_stage(
             hidden_states,
             positions,
             input_ids,
             pre_mix,
-            post_mix,
-            res_mix,
-            residual,
             aux_hidden_by_layer,
             engram_hashes,
             engram_mask,
+            full_num_tokens,
         )
-        late_aux: list[torch.Tensor] = []
-        if self.decoder_replay_layers is not None:
-            hidden_states, pre_mix, *late_aux = self.decoder_replay_layers(
-                hidden_states,
-                positions,
-                input_ids,
-                pre_mix,
-                post_mix,
-                res_mix,
-                residual,
-            )
-        else:
-            hidden_states = self._collapse(
-                hidden_states,
-                residual,
-                post_mix,
-                res_mix,
-                aux_hidden_by_layer,
-                full_num_tokens,
-            )
 
         aux_hidden_states = [
             aux_hidden_by_layer[layer_id]
@@ -1303,15 +1298,66 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             aux_hidden_by_layer[self.end_layer] = final_aux
         return hidden_states
 
+    def _run_stage(
+        self,
+        hidden_states: torch.Tensor | MoEOutput,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        pre_mix: torch.Tensor | None,
+        aux_hidden_by_layer: dict[int, torch.Tensor],
+        engram_hashes: torch.Tensor | None,
+        engram_mask: torch.Tensor | None,
+        full_num_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
+        """This stage's layers, through the replay when it has one; returns the
+        collapsed output, the last FFN's pre-mix and the replay's aux states."""
+        residual, post_mix, res_mix = None, None, None
+        # A stage starting at the replay (VLLM_DSV41_PP_BOUNDED_REPLAY) hands
+        # the replay layers the incoming stream with no residual or mixes.
+        if self.start_layer < self.decoder_replay_start:
+            hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
+                range(self.start_layer, self.decoder_replay_start),
+                hidden_states,
+                positions,
+                input_ids,
+                pre_mix,
+                post_mix,
+                res_mix,
+                residual,
+                aux_hidden_by_layer,
+                engram_hashes,
+                engram_mask,
+            )
+        if self.decoder_replay_layers is None:
+            hidden_states = self._collapse(
+                hidden_states,
+                residual,
+                post_mix,
+                res_mix,
+                aux_hidden_by_layer,
+                full_num_tokens,
+            )
+            return hidden_states, pre_mix, []
+        hidden_states, pre_mix, *late_aux = self.decoder_replay_layers(
+            hidden_states,
+            positions,
+            input_ids,
+            pre_mix,
+            post_mix,
+            res_mix,
+            residual,
+        )
+        return hidden_states, pre_mix, late_aux
+
     def _run_replay_layers(
         self,
         hidden_states: torch.Tensor | MoEOutput,
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
-        pre_mix: torch.Tensor,
-        post_mix: torch.Tensor,
-        res_mix: torch.Tensor,
-        residual: torch.Tensor,
+        pre_mix: torch.Tensor | None,
+        post_mix: torch.Tensor | None,
+        res_mix: torch.Tensor | None,
+        residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, ...]:
         """Layers ``decoder_replay_start``.. on the given rows; returns their output,
         the last FFN's pre-mix and the aux hidden states they capture."""
@@ -1345,6 +1391,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             ),
         )
 
+    def _decoder_replay_enabled(self, vllm_config: VllmConfig, cut: int) -> bool:
+        """Whether this rank replays from layer ``cut``: it runs a layer past
+        the cut, may replay, and the cut's sliding-window cache bounds it."""
+        return (
+            cut < self.end_layer - 1
+            and self._decoder_replay_supported(vllm_config, cut)
+            and self.layers[cut].attn.swa_cache_layer.bounded_replay
+        )
+
     def _decoder_replay_supported(self, vllm_config: VllmConfig, cut: int) -> bool:
         """Whether this rank may replay from layer ``cut`` on; warns when not."""
         parallel_config = vllm_config.parallel_config
@@ -1355,12 +1410,27 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         draft_layer_types = getattr(draft_hf_config, "layer_types", None) or ()
         window = self.config.sliding_window
         # A stage that starts at the cut runs no layer before the replay and so
-        # has no residual/post_mix to hand it (PP 20,20 over 40 layers).
-        if self.start_layer >= cut or self.end_layer < self.config.num_hidden_layers:
+        # has no residual/post_mix to hand it (PP 20,20 over 40 layers); the
+        # replay then starts from the incoming stream under the flag, as long
+        # as no sharing state arrives from earlier stages.
+        stage_reason = decoder_replay_stage_reason(
+            self.start_layer,
+            self.end_layer,
+            cut,
+            self.config.num_hidden_layers,
+            allow_start_at_cut=envs.VLLM_DSV41_PP_BOUNDED_REPLAY,
+        )
+        if (
+            stage_reason is None
+            and self.start_layer == cut
+            and self.pipeline_sharing is not None
+        ):
             reason = (
-                "the pipeline stage holding the last KV source layer must also "
-                "hold every layer after it, and a layer before it"
+                "VLLM_DSV41_PP_BOUNDED_REPLAY is ignored with deepseek_v41_pp_sharing "
+                "(the shared state is indexed by full-batch rows)"
             )
+        elif stage_reason is not None:
+            reason = stage_reason
         elif (
             self.use_sequence_parallel
             or parallel_config.prefill_context_parallel_size > 1

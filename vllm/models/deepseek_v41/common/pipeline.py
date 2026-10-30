@@ -108,3 +108,30 @@ def validate_local_sharing(dependencies: tuple[SharingDependency, ...]) -> None:
             f"{detail}. Keep each sharing group on one stage or explicitly enable "
             "the experimental deepseek_v41_pp_sharing eager path."
         )
+
+
+def decoder_replay_stage_reason(
+    start_layer: int,
+    end_layer: int,
+    cut: int,
+    num_layers: int,
+    allow_start_at_cut: bool,
+) -> str | None:
+    """Why the stage holding layers ``[start_layer, end_layer)`` cannot run the
+    decoder-side SWA bounded replay from the last KV source ``cut``, or None.
+
+    The replay writes layer ``cut``'s KV for every row and then runs layers
+    ``cut``.. on each request's trailing window, so the stage must hold all of
+    them. With every sharing group local to its stage, the rows' hidden states
+    are all such a stage reads from earlier ones, so one starting at ``cut``
+    (PP 20,20) qualifies too with ``allow_start_at_cut``. Earlier stages hold
+    KV sources that need every row, so they never replay.
+    """
+    holds_cut = start_layer <= cut if allow_start_at_cut else start_layer < cut
+    if not holds_cut or end_layer < num_layers:
+        return (
+            "the pipeline stage holding the last KV source layer must also "
+            "hold every layer after it"
+            + ("" if allow_start_at_cut else ", and a layer before it")
+        )
+    return None

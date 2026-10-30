@@ -170,6 +170,8 @@ if TYPE_CHECKING:
     VLLM_MLA_DISABLE: bool = False
     VLLM_DSV41_AMPERE_FUSED_DECODE: bool = True
     VLLM_DSV41_AMPERE_KV_MXFP8: bool = True
+    VLLM_DSV41_INDEXER_SHARD_CANDIDATE_ROWS: bool = False
+    VLLM_DSV41_PP_BOUNDED_REPLAY: bool = False
     VLLM_SM80_TRITON_HC_PRENORM: bool = True
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
@@ -1478,6 +1480,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # records' caches are not interchangeable.
     "VLLM_DSV41_AMPERE_KV_MXFP8": lambda: bool(
         int(os.getenv("VLLM_DSV41_AMPERE_KV_MXFP8", "1"))
+    ),
+    # DeepSeek V4.1: shard the prefill rows of the candidate indexers (the
+    # candidate source and the ratio-1 indexers masked by it) across TP ranks,
+    # like the other indexers, and exchange their top-k and candidate blocks.
+    # Takes effect only where indexer row sharding is active: its default
+    # attention_config.indexer_tp_shard_min_rows (65536) exceeds a typical
+    # max_num_batched_tokens, so pair it with e.g. --attention-config
+    # '{"indexer_tp_shard_min_rows": 1024}', which row-shards every indexer.
+    # Exactly tied scores may break differently than in replicated scoring.
+    "VLLM_DSV41_INDEXER_SHARD_CANDIDATE_ROWS": lambda: bool(
+        int(os.getenv("VLLM_DSV41_INDEXER_SHARD_CANDIDATE_ROWS", "0"))
+    ),
+    # DeepSeek V4.1: let a pipeline stage that starts at the last KV source
+    # layer (PP 20,20) run decoder-side SWA bounded replay, from the hidden
+    # states the previous stage hands it. NVIDIA model only; ignored with
+    # deepseek_v41_pp_sharing.
+    "VLLM_DSV41_PP_BOUNDED_REPLAY": lambda: bool(
+        int(os.getenv("VLLM_DSV41_PP_BOUNDED_REPLAY", "0"))
     ),
     # SM8x mHC: split-K 3xTF32 tensor-core prenorm GEMM instead of the
     # per-token TileLang kernel (DeepGEMM's TF32 kernel is SM90+).
