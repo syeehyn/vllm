@@ -280,7 +280,7 @@ def fused_sparse_decode(
     out: torch.Tensor,  # [T, H, 512]
     num_warps: int = 4,
     num_stages: int = 3,  # best or within 4% of best at T 64..1024 on A100-40GB (v3e sweep)
-    block_n: int = _BLOCK_N,
+    block_n: int | None = None,  # 16 for the 584-byte record, 32 for the 528-byte one (A100 sweeps)
     merged: bool = True,
     direct: bool = True,
 ) -> torch.Tensor:
@@ -289,6 +289,9 @@ def fused_sparse_decode(
     rec_bytes = swa_cache.shape[-1]
     assert dim == HEAD_DIM and rec_bytes in (BYTES_PER_TOKEN, V41_BYTES_PER_TOKEN)
     mx = rec_bytes == V41_BYTES_PER_TOKEN
+    if block_n is None:
+        # 528 B records leave room for 3 stages of 32-key tiles; 584 B ones do not.
+        block_n = 32 if mx else _BLOCK_N
     assert merged or not mx, "the 528-byte record has no separate BF16 RoPE tail"
     swa_idx = swa_indices.reshape(T, -1)
     if swa_idx.stride(-1) != 1:
