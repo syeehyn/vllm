@@ -695,13 +695,13 @@ def get_kv_cache_config_from_groups(
 
     kv_cache_tensors = []
     for group in kv_cache_groups:
-        group_spec = group.kv_cache_spec
+        # Iterate this worker's layers, not the (possibly global) spec dict: a
+        # PP stage that owns none of a uniform group's layers keeps the global
+        # UniformTypeKVCacheSpecs (see _project_kv_cache_groups_to_worker) and
+        # must not allocate the other stage's layers (upstream #60234).
         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
-        if isinstance(group_spec, UniformTypeKVCacheSpecs):
-            for layer_name, spec in group_spec.kv_cache_specs.items():
-                layers_by_spec[spec].append(layer_name)
-        elif group.layer_names:
-            layers_by_spec[group_spec].extend(group.layer_names)
+        for layer_name in group.layer_names:
+            layers_by_spec[_get_per_layer_spec(group, layer_name)].append(layer_name)
 
         byte_offset = 0
         for spec, layer_names in layers_by_spec.items():
