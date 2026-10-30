@@ -1354,10 +1354,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         draft_window = getattr(draft_hf_config, "sliding_window", None)
         draft_layer_types = getattr(draft_hf_config, "layer_types", None) or ()
         window = self.config.sliding_window
-        if self.start_layer > cut or self.end_layer < self.config.num_hidden_layers:
+        # A stage that starts at the cut runs no layer before the replay and so
+        # has no residual/post_mix to hand it (PP 20,20 over 40 layers).
+        if self.start_layer >= cut or self.end_layer < self.config.num_hidden_layers:
             reason = (
                 "the pipeline stage holding the last KV source layer must also "
-                "hold every layer after it"
+                "hold every layer after it, and a layer before it"
             )
         elif (
             self.use_sequence_parallel
