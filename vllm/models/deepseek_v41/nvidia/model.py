@@ -273,6 +273,12 @@ def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
     moe_needs_token_sharded_input = (
         vllm_config.kernel_config.moe_backend in MEGA_MOE_BACKENDS
     )
+    # Restored from becc06f5: the dsv41-ampere merge (d57eb1fe) dropped this
+    # definition, so every PP>1 launch raised NameError here.
+    additional_config = vllm_config.additional_config
+    pp_sp_enabled = isinstance(additional_config, dict) and additional_config.get(
+        "deepseek_v41_pp_sp", False
+    )
     return (
         (parallel_config.pipeline_parallel_size == 1 or pp_sp_enabled)
         and parallel_config.enable_expert_parallel
