@@ -12,6 +12,7 @@ from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_dp_group, get_pcp_group, get_pp_group
 from vllm.forward_context import BatchDescriptor, DPMetadata, create_forward_context
+from vllm.logger import init_logger
 from vllm.models.deepseek_v41.decoder_replay_layers import (
     DecoderReplayLayers,
     ReplayBatch,
@@ -36,6 +37,8 @@ from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
+
+logger = init_logger(__name__)
 
 @triton.jit
 def _gather_lookback_kernel(
@@ -168,6 +171,21 @@ class ReplayAttnMetadata(ModelSpecificAttnMetadata):
         if isinstance(attn_metadata_builder, DeepseekSparseSWAMetadataBuilder):
             return {"replay_start": self.replay_start[:num_reqs]}
         return {}
+
+
+def replay_cacheable_groups(specs: list, num_slot_rows: int) -> list[int]:
+    """Indices of the prefix-cacheable KV groups, whose replayed slots get padded.
+
+    The indices address rows of the runner's slot mappings, so they must come
+    from the KV config those mappings were built for."""
+    groups = [i for i, spec in enumerate(specs) if spec.prefix_cacheable]
+    if len(specs) != num_slot_rows or any(g >= num_slot_rows for g in groups):
+        raise RuntimeError(
+            f"SWA replay groups {groups} come from a KV config with {len(specs)} "
+            f"groups but the slot mappings have {num_slot_rows} rows"
+        )
+    logger.info("SWA bounded replay pads KV groups %s of %d", groups, len(specs))
+    return groups
 
 
 class DeepseekV41ModelState(DefaultModelState):
@@ -304,6 +322,20 @@ class DeepseekV41ModelState(DefaultModelState):
         model_inputs["lookback_token_ids"] = window
         return model_inputs
 
+    def initialize_kv_cache(
+        self, kv_cache_config: KVCacheConfig, block_tables: BlockTables
+    ) -> None:
+        super().initialize_kv_cache(kv_cache_config, block_tables)
+        # CUDA-graph memory profiling binds a throwaway per-stage KV config
+        # first, and its group indices differ from the real ones (PP0 put the
+        # prefix-cacheable group at 7 of 9 vs 4 of 6). Cached past this point,
+        # every prefix hit padded the wrong slot-mapping row: out of bounds on
+        # PP0, which overwrote a layer-19 norm weight, and a non-cacheable
+        # group on PP1. Rebuild from the real config on the next prepare_attn.
+        self._replay = None
+        if self.decoder_replay_layers is not None:
+            self._kept_slot_mappings = None
+
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
         if self.lookback_token_ids is not None:
@@ -329,7 +361,7 @@ class DeepseekV41ModelState(DefaultModelState):
             self._replay = (
                 max(spec.prefix_replay_tokens for spec in specs),
                 torch.tensor(
-                    [i for i, spec in enumerate(specs) if spec.prefix_cacheable],
+                    replay_cacheable_groups(specs, slot_mappings.shape[0]),
                     dtype=torch.int32,
                     device=self.device,
                 ),
