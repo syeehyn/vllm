@@ -29,6 +29,9 @@ _PREFILL_AUTOTUNE_CONFIGS = [
 _PREFILL_WARMUP_M = 8
 _PREFILL_WARMUP_N = 8192
 
+# CUDA's limit on gridDim.y and gridDim.z; gridDim.x goes up to 2^31 - 1.
+_MAX_GRID_DIM_YZ = 65535
+
 
 _E4M3FN_BF16_LUT_CACHE: dict[torch.device, torch.Tensor] = {}
 
@@ -59,7 +62,9 @@ def _decode_e4m3fn_bf16_lut(u, lut_ptr):
     configs=_PAGED_AUTOTUNE_CONFIGS,
     key=["num_heads", "head_dim", "block_size"],
 )
-@triton.jit
+# The block table and logits row strides change with the batch; specializing on
+# them (Triton's `== 1` and `% 16 == 0` classes) would recompile while serving.
+@triton.jit(do_not_specialize=["stride_bt_b", "stride_l_t"])
 def _fp8_paged_mqa_logits_kernel(
     q_ptr,
     kv_fp8_ptr,
@@ -284,7 +289,12 @@ def fp8_paged_mqa_logits_triton(
     # prefill with varying N doesn't re-tune on every new chunk size.
     key=["num_heads", "head_dim"],
 )
-@triton.jit
+# N, the logits width and the row-sliced inputs' alignment change with the
+# chunk; specializing on them would recompile while serving.
+@triton.jit(
+    do_not_specialize=["stride_l_m", "OUT_WIDTH", "N"],
+    do_not_specialize_on_alignment=["k_scale_ptr", "weights_ptr", "ks_ptr", "ke_ptr"],
+)
 def _fp8_mqa_logits_kernel(
     q_ptr,
     k_ptr,
@@ -315,8 +325,8 @@ def _fp8_mqa_logits_kernel(
     # prefill this is ~2× the in-kernel LUT (LUT lookups contend with the
     # matmul for ALU/regs). Paged-decode keeps the LUT path.
     """Compute dense FP8 MQA logits within each query key interval."""
-    m = tl.program_id(0)
-    n_block = tl.program_id(1)
+    n_block = tl.program_id(0)
+    m = tl.program_id(1)
 
     n_start = n_block * BLOCK_N
     offs_n = n_start + tl.arange(0, BLOCK_N)
@@ -403,8 +413,8 @@ def fp8_mqa_logits_triton(
         clean_logits: when False, skip the -inf pre-fill of the output
             (indexer top-k reads only `[ks, ke)` per row). Matches DeepGEMM.
         max_seqlen_k: when given, emit DeepGEMM's row-local layout of width
-            ``max_seqlen_k`` (column ``j`` of row ``m`` is K position
-            ``ks[m] + j``) instead of the absolute ``[M, N]`` layout.
+            `max_seqlen_k` (column `j` of row `m` is K position
+            `ks[m] + j`) instead of the absolute `[M, N]` layout.
 
     Returns:
         logits:       [M, N] or [M, max_seqlen_k] float32
@@ -434,8 +444,10 @@ def fp8_mqa_logits_triton(
     q_bf16 = q.to(torch.bfloat16)
     k_bf16 = k_fp8.to(torch.bfloat16)
 
-    # Grid depends on the autotuned BLOCK_N.
-    grid = lambda meta: (M, triton.cdiv(N, meta["BLOCK_N"]))  # noqa: E731
+    # Grid depends on the autotuned BLOCK_N. The K tiles go on axis 0: CUDA
+    # caps the other grid axes at 65535 blocks, fewer than a long gathered K has.
+    assert M <= _MAX_GRID_DIM_YZ, f"{M} query rows exceed the CUDA grid limit"
+    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]), M)  # noqa: E731
     _fp8_mqa_logits_kernel[grid](
         q_bf16,
         k_bf16,
@@ -481,7 +493,10 @@ def warmup_fp8_mqa_logits_triton(
     weights = torch.zeros(m, num_heads, dtype=torch.float32, device=device)
     ks = torch.zeros(m, dtype=torch.int32, device=device)
     ke = torch.full((m,), n, dtype=torch.int32, device=device)
-    fp8_mqa_logits_triton(q, (k, scales), weights, ks, ke)
+    # The row-local variant is the one sparse_attn_indexer launches.
+    fp8_mqa_logits_triton(
+        q, (k, scales), weights, ks, ke, clean_logits=False, max_seqlen_k=n
+    )
 
 
 def warmup_fp8_paged_mqa_logits_triton(
@@ -499,8 +514,15 @@ def warmup_fp8_paged_mqa_logits_triton(
         num_blocks, block_size, 1, head_dim + 4, dtype=torch.uint8, device=device
     )
     weights = torch.zeros(1, num_heads, dtype=torch.float32, device=device)
-    context_lens = torch.tensor([block_size], dtype=torch.int32, device=device)
+    # Per-token `[B, next_n]` lengths: the variant the indexer metadata launches.
+    context_lens = torch.tensor([[block_size]], dtype=torch.int32, device=device)
     block_tables = torch.zeros(1, 1, dtype=torch.int32, device=device)
     fp8_paged_mqa_logits_triton(
-        q, kv_cache, weights, context_lens, block_tables, max_model_len=block_size
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        max_model_len=block_size,
+        clean_logits=False,
     )

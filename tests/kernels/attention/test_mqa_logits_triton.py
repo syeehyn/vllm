@@ -12,10 +12,7 @@ from vllm.v1.attention.ops.mqa_logits_triton import (
     fp8_paged_mqa_logits_triton,
 )
 
-pytestmark = pytest.mark.skipif(
-    not current_platform.is_cuda_alike(),
-    reason="Triton MQA logits kernels require CUDA/ROCm",
-)
+pytestmark = pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
 
 
 def _quantize_k_per_row(
@@ -52,7 +49,8 @@ def _pack_paged_kv(kv_bf16: torch.Tensor) -> torch.Tensor:
 
 
 # References adapted from DeepGEMM (test_attention.py) — used as the spec
-# the Triton kernels must agree with.
+# the Triton kernels must agree with. They score the dequantized bytes in
+# float64, so the comparison measures the kernels' own rounding.
 def _fp8_mqa_logits_ref(
     q: torch.Tensor,
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -63,12 +61,12 @@ def _fp8_mqa_logits_ref(
     """Compute dense MQA indexing logits from dequantized keys."""
     k_fp8, scale = kv
     seq_len_kv = k_fp8.shape[0]
-    k = k_fp8.to(torch.bfloat16)
-    q = q.to(torch.bfloat16)
+    k = k_fp8.float().double() * scale.double()[:, None]
+    q = q.float().double()
     arange = torch.arange(0, seq_len_kv, device=q.device)[None, :]
     mask = (arange >= cu_seqlen_ks[:, None]) & (arange < cu_seqlen_ke[:, None])
-    score = torch.einsum("mhd,nd->hmn", q, k).float() * scale
-    logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
+    score = torch.einsum("mhd,nd->hmn", q, k)
+    logits = (score.relu() * weights.double().unsqueeze(-1).transpose(0, 1)).sum(dim=0)
     return logits.masked_fill(~mask, float("-inf"))
 
 
@@ -90,13 +88,14 @@ def _fp8_paged_mqa_logits_ref(
         flat[:, :k_end].reshape(num_blocks, block_size, 1, dim).view(fp8_dtype).float()
     )
     scale = flat[:, k_end:].view(torch.float32).reshape(num_blocks, block_size, 1, 1)
-    q = q.float()
-    kv_data = kv_data * scale
+    q = q.float().double()
+    weights = weights.double()
+    kv_data = kv_data.double() * scale.double()
     logits = torch.full(
         [batch_size * next_n, max_model_len],
         float("-inf"),
         device=q.device,
-        dtype=torch.float32,
+        dtype=torch.float64,
     )
     if context_lens.ndim == 1:
         token_offsets = torch.arange(next_n - 1, -1, -1, device=q.device)
@@ -142,11 +141,11 @@ def _fp8_paged_mqa_logits_ref(
     return logits
 
 
-# Looser tolerance to accommodate FP8 rounding and the paged torch
-# reference using fp32 matmul while the triton kernel uses bf16 matmul
-# (with an fp32 accumulator, matching the DeepGEMM path).
-_ATOL = 1.0
-_RTOL = 0.2
+# The kernels multiply exact E4M3 values with an fp32 accumulator, so only the
+# fp32 rounding of the per-head scale, weight and sum separates them from the
+# float64 references.
+_ATOL = 1e-4
+_RTOL = 1e-5
 
 
 @pytest.mark.parametrize("M,N", [(64, 64), (128, 256), (256, 512)])
@@ -198,7 +197,7 @@ def test_fp8_mqa_logits_triton_matches_torch(
     finite = ~torch.isinf(out_torch)
     if finite.any():
         torch.testing.assert_close(
-            out_triton[finite], out_torch[finite], atol=_ATOL, rtol=_RTOL
+            out_triton[finite].double(), out_torch[finite], atol=_ATOL, rtol=_RTOL
         )
 
 
@@ -228,7 +227,7 @@ def test_fp8_mqa_logits_triton_row_local_layout(M, N, num_heads):
     width = int((ke - ks).max().item())
 
     abs_ref = _fp8_mqa_logits_ref(q_fp8, (k_fp8, k_scales), weights, ks, ke)
-    expected = torch.full((M, width), float("-inf"), dtype=torch.float32, device=device)
+    expected = torch.full((M, width), float("-inf"), dtype=torch.float64, device=device)
     for m in range(M):
         start, end = int(ks[m].item()), int(ke[m].item())
         expected[m, : end - start] = abs_ref[m, start:end]
@@ -247,7 +246,9 @@ def test_fp8_mqa_logits_triton_row_local_layout(M, N, num_heads):
         torch.isinf(out) & (out < 0), torch.isinf(expected) & (expected < 0)
     )
     finite = ~torch.isinf(expected)
-    torch.testing.assert_close(out[finite], expected[finite], atol=_ATOL, rtol=_RTOL)
+    torch.testing.assert_close(
+        out[finite].double(), expected[finite], atol=_ATOL, rtol=_RTOL
+    )
 
 
 def test_fp8_mqa_logits_triton_clean_logits_false_overwrites_masked():
@@ -300,6 +301,59 @@ def test_fp8_mqa_logits_triton_clean_logits_false_overwrites_masked():
             f"(should be -inf). Sample leaked values: {sample}. "
             "Likely cause: the kernel's K-tile early-exit branch returns "
             "without writing -inf, so downstream top-k reads garbage."
+        )
+
+
+def test_fp8_mqa_logits_triton_long_gathered_k():
+    """A chunk whose gathered K spans more than 65535 tiles of the smallest
+    BLOCK_N, the CUDA limit on grid axes 1 and 2. The head count is one no
+    other test uses, so the autotune sweep launches every BLOCK_N."""
+    torch.manual_seed(0)
+    M, num_heads, head_dim = 2, 24, 128
+    N = 65535 * 32 + 33
+    device = "cuda"
+
+    q_fp8 = torch.randn(M, num_heads, head_dim, dtype=torch.bfloat16, device=device).to(
+        torch.float8_e4m3fn
+    )
+    weights = torch.randn(M, num_heads, dtype=torch.float32, device=device)
+    k_bytes = torch.empty(N, head_dim, dtype=torch.uint8, device=device)
+    k_scales = torch.empty(N, dtype=torch.float32, device=device)
+    for start in range(0, N, 2**18):
+        rows = slice(start, min(start + 2**18, N))
+        k_rows, k_scales[rows] = _quantize_k_per_row(
+            torch.randn(
+                rows.stop - rows.start, head_dim, dtype=torch.bfloat16, device=device
+            )
+        )
+        k_bytes[rows] = k_rows.view(torch.uint8)
+    k_fp8 = k_bytes.view(torch.float8_e4m3fn)
+    # Row 0 spans every tile; row 1 only the last ones.
+    tail = 1000
+    ks = torch.tensor([0, N - tail], dtype=torch.int32, device=device)
+    ke = torch.full((M,), N, dtype=torch.int32, device=device)
+
+    out = fp8_mqa_logits_triton(
+        q_fp8, (k_fp8, k_scales), weights, ks, ke, clean_logits=True, max_seqlen_k=N
+    )
+
+    assert out.shape == (M, N)
+    assert torch.isinf(out[1, tail:]).all()
+    positions = torch.cat(
+        [
+            torch.arange(64, device=device),
+            torch.randint(64, N - 64, (4096,), device=device),
+            torch.arange(N - 64, N, device=device),
+        ]
+    )
+    q64, w64 = q_fp8.float().double(), weights.double()
+    for m in range(M):
+        pos = positions[positions >= ks[m]]
+        k64 = k_bytes[pos].view(torch.float8_e4m3fn).float().double()
+        k64 *= k_scales[pos, None].double()
+        expected = ((q64[m] @ k64.T).relu() * w64[m, :, None]).sum(dim=0)
+        torch.testing.assert_close(
+            out[m, pos - ks[m]].double(), expected, atol=_ATOL, rtol=_RTOL
         )
 
 
@@ -391,7 +445,7 @@ def test_fp8_paged_mqa_logits_triton_matches_torch(
     finite = readable & ~inf_torch
     if finite.any():
         torch.testing.assert_close(
-            out_triton[:, :context_len][finite],
+            out_triton[:, :context_len][finite].double(),
             out_torch[:, :context_len][finite],
             atol=_ATOL,
             rtol=_RTOL,
@@ -419,7 +473,7 @@ def test_fp8_paged_mqa_logits_triton_strided_pool_no_int32_overflow():
         total_blocks * pool_stride
         + total_blocks * block_size * head_dim * 2
         + total_blocks * block_size * (head_dim + 4)
-        + 2 * total_blocks * block_size * head_dim * 4
+        + total_blocks * block_size * head_dim * (4 + 8)
         + 64 * 2**20  # headroom for kernel workspace and reference temporaries
     )
     free_bytes, _ = torch.accelerator.get_memory_info()
@@ -478,7 +532,7 @@ def test_fp8_paged_mqa_logits_triton_strided_pool_no_int32_overflow():
     assert torch.equal(inf_torch, inf_triton)
     finite = ~inf_torch
     torch.testing.assert_close(
-        out_triton[finite], out_torch[finite], atol=_ATOL, rtol=_RTOL
+        out_triton[finite].double(), out_torch[finite], atol=_ATOL, rtol=_RTOL
     )
 
 
@@ -557,7 +611,7 @@ def test_fp8_paged_mqa_logits_triton_packed_pool_pages(layout, num_heads):
     assert torch.equal(inf_torch, torch.isinf(out_pool) & (out_pool < 0))
     finite = ~inf_torch
     torch.testing.assert_close(
-        out_pool[finite], out_torch[finite], atol=_ATOL, rtol=_RTOL
+        out_pool[finite].double(), out_torch[finite], atol=_ATOL, rtol=_RTOL
     )
 
 
