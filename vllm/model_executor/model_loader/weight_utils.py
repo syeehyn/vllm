@@ -1031,14 +1031,29 @@ def _prefetch_all_checkpoints(
     sorted_files: list[str],
     num_prefetch_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
+    rank_and_world_size: tuple[int, int] | None = None,
 ) -> None:
-    """Start prefetching checkpoint files into page cache in a background thread."""
+    """Start prefetching checkpoint files into page cache in a background thread.
+
+    The files are dealt round-robin to the ranks that load the same
+    *sorted_files*, so that together they prefetch each file once. By default
+    those are all ranks of the `torch.distributed` world. Pass
+    *rank_and_world_size* when a smaller group shares the list, e.g. the
+    tensor-parallel ranks of one pipeline-parallel stage, whose file list holds
+    only that stage's shards.
+    """
     if num_prefetch_threads < 1:
         raise ValueError("safetensors prefetch num threads must be >= 1")
     if block_size < 1:
         raise ValueError("safetensors prefetch block size must be >= 1")
 
-    if torch.distributed.is_initialized():
+    if rank_and_world_size is not None:
+        rank, world_size = rank_and_world_size
+        if not 0 <= rank < world_size:
+            raise ValueError(
+                f"prefetch rank {rank} is outside of world size {world_size}"
+            )
+    elif torch.distributed.is_initialized():
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
     else:
@@ -1112,6 +1127,7 @@ def safetensors_weights_iterator(
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
     shuffle_safetensors_files: bool = False,
     is_unused_weight: Callable[[str], bool] | None = None,
+    prefetch_rank_and_world_size: tuple[int, int] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
@@ -1123,6 +1139,10 @@ def safetensors_weights_iterator(
     accepts are skipped the same way. Under pipeline parallelism this keeps a
     rank from reading the other stages' layers out of a shard it shares with
     them.
+
+    *prefetch_rank_and_world_size* names this rank's position among the ranks
+    that were handed the same *hf_weights_files*, for splitting the prefetch
+    between them; see `_prefetch_all_checkpoints`.
     """
 
     def skip(name: str) -> bool:
@@ -1198,6 +1218,7 @@ def safetensors_weights_iterator(
             sorted_files,
             num_prefetch_threads=safetensors_prefetch_num_threads,
             block_size=safetensors_prefetch_block_size,
+            rank_and_world_size=prefetch_rank_and_world_size,
         )
 
     if shuffle_safetensors_files:

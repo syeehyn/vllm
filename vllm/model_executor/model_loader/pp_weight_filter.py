@@ -42,6 +42,23 @@ def get_pp_stage() -> tuple[int, int] | None:
     return pp_group.rank_in_group, pp_group.world_size
 
 
+def get_pp_stage_prefetch_split() -> tuple[int, int]:
+    """Return `(rank, world_size)` for splitting the checkpoint prefetch among
+    the ranks that load the same pipeline-parallel stage.
+
+    These are the ranks of this process' tensor-parallel group: the rank layout
+    is `... x PP x PCP x TP` (see `ensure_model_parallel_initialized`), so a TP
+    group never spans two stages, and it is read from the group itself instead
+    of being derived from the global `torch.distributed` rank. With prefill
+    context parallelism a stage has several TP groups; each then prefetches the
+    whole stage, which is redundant only where they share a page cache.
+    """
+    from vllm.distributed.parallel_state import get_tp_group
+
+    tp_group = get_tp_group()
+    return tp_group.rank_in_group, tp_group.world_size
+
+
 def find_pp_layer_range(model: nn.Module) -> tuple[int, int] | None:
     """Return `(start_layer, end_layer)` of the decoder stack built by
     `make_layers`, or `None` when no module of *model* records one."""

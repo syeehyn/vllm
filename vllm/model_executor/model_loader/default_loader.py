@@ -27,6 +27,7 @@ from vllm.model_executor.model_loader.ep_weight_filter import (
 from vllm.model_executor.model_loader.pp_weight_filter import (
     find_pp_layer_range,
     get_pp_stage,
+    get_pp_stage_prefetch_split,
 )
 from vllm.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
@@ -372,6 +373,13 @@ class DefaultModelLoader(BaseModelLoader):
                             self.load_config.shuffle_safetensors_files
                         ),
                         is_unused_weight=is_unused_tensor,
+                        # The file list is this stage's alone, so only the
+                        # ranks of this stage can share its prefetch.
+                        prefetch_rank_and_world_size=(
+                            get_pp_stage_prefetch_split()
+                            if is_unused_tensor is not None
+                            else None
+                        ),
                     )
         else:
             if extra_config.get("enable_multithread_load"):
