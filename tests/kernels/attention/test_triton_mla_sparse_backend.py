@@ -72,6 +72,7 @@ def _packed_kv_cache(device: str) -> tuple[MLAAttentionSpec, torch.Tensor]:
             dtype=torch.bfloat16,
         ),
     )
+    assert isinstance(spec, MLAAttentionSpec)
     specs = {
         "mla": spec,
         "indexer": MLAAttentionSpec(

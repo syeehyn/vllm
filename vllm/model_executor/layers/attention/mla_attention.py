@@ -711,6 +711,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 "FLASH_ATTN_MLA_SPARSE_FA4",
                 "DEEPSEEK_V32_INDEXER",
                 "ROCM_AITER_MLA_SPARSE",
+                "TRITON_MLA_SPARSE",
             ):
                 from vllm.v1.attention.backends.mla.compressor_utils import (
                     _COMPRESSED_SLOT_MAPPING_KERNEL,
@@ -724,7 +725,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 _PREPARE_UNIFORM_DECODE_KERNEL.register_warmup()
                 _BUILD_PREFILL_CHUNK_METADATA_KERNEL.register_warmup()
 
-                if backend_name != "DEEPSEEK_V32_INDEXER":
+                # TRITON_MLA_SPARSE builds XPUMLASparseMetadata, without it.
+                if backend_name not in ("DEEPSEEK_V32_INDEXER", "TRITON_MLA_SPARSE"):
                     from vllm.v1.attention.backends.mla.sparse_swa import (
                         _COMPUTE_PREFILL_METADATA_KERNEL,
                     )
@@ -829,7 +831,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
     def _uses_flat_kv_cache(self) -> bool:
         backend = self.attn_backend.get_name()
-        return backend in ("FLASHINFER_MLA_SPARSE", "FLASH_ATTN_MLA_SPARSE_FA4") or (
+        return backend in (
+            "FLASHINFER_MLA_SPARSE",
+            "FLASH_ATTN_MLA_SPARSE_FA4",
+            "TRITON_MLA_SPARSE",
+        ) or (
             backend == "FLASHMLA_SPARSE"
             and self.kv_cache_dtype not in ("fp8_ds_mla", "nvfp4_ds_mla")
         )
