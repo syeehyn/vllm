@@ -97,6 +97,9 @@ def _assert_topk(topk: torch.Tensor, ref: torch.Tensor, visible: torch.Tensor):
         pytest.param(
             [(999, 1), (2999, 1), (6099, 1), (4499, 1)], [], 1, 512, id="uniform_decode"
         ),
+        # Past 32768 keys the decode top-k takes its multi-CTA radix path, on
+        # fp32 logits whose row stride is the batch's longest context.
+        pytest.param([(40000, 1), (33001, 1)], [], 1, 512, id="long_decode"),
         # The middle request holds one token of next_n = 2: the padded path.
         pytest.param([(2998, 2), (4100, 1), (2500, 2)], [], 2, 512, id="ragged_decode"),
         pytest.param(
@@ -254,7 +257,7 @@ def test_topk_matches_float64_reference(
         first = seq_len - next_n + 1 if r < num_decodes else context + 1
         for lo in range(0, new_tokens, 128):
             rows = slice(start + lo, start + min(lo + 128, new_tokens))
-            ref = torch.einsum("thd,nd->thn", q_deq[rows], keys).relu_()
+            ref = torch.einsum("mhd,nd->mhn", q_deq[rows], keys).relu_()
             ref = (ref * weights[rows, :, None]).sum(1)
             visible = first + torch.arange(lo, lo + ref.shape[0], device="cuda")
             _assert_topk(topk[rows], ref, visible)
