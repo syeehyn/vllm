@@ -31,9 +31,24 @@ from vllm.vllm_flash_attn.flash_attn_interface import (  # noqa: E402
 )
 
 if not (FA2_AVAILABLE or FA3_AVAILABLE):
-    raise ImportError(
-        "vllm.vllm_flash_attn requires the CUDA flash attention extensions "
-        "(_vllm_fa2_C or _vllm_fa3_C). On ROCm, use upstream flash_attn."
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        raise ImportError(
+            "vllm.vllm_flash_attn requires the CUDA flash attention extensions "
+            "(_vllm_fa2_C or _vllm_fa3_C). On ROCm, use upstream flash_attn."
+        )
+
+    # fa_utils imports this package unconditionally on CUDA, so a build without
+    # the extensions must stay importable; is_fa_version_supported() reports
+    # them as unavailable.
+    import warnings
+
+    warnings.warn(
+        "vllm.vllm_flash_attn was built without the CUDA flash attention "
+        "extensions (_vllm_fa2_C or _vllm_fa3_C); FA2/FA3 are unavailable.",
+        RuntimeWarning,
+        stacklevel=2,
     )
 
 __all__ = [
