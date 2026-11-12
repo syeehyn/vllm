@@ -45,6 +45,18 @@ from vllm.v1.attention.backends.mla.indexer import (
 pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda(), reason="Triton indexer prologues need CUDA"
 )
+# The fused prologues write fp8_ds_mla rows with Triton's fp8e4nv casts. They
+# are packed in only for an fp8_ds_mla KV cache, which no sparse MLA backend
+# serves below SM90.
+requires_native_fp8 = pytest.mark.skipif(
+    not _native_fp8(), reason="the fused prologue's fp8e4nv casts need SM89+"
+)
+# indexer_kv_dtype="mxfp4" is rejected off SM10x; ptxas has no e2m1 conversion
+# below SM100.
+requires_mxfp4 = pytest.mark.skipif(
+    not current_platform.has_device_capability(100),
+    reason="the MXFP4 e2m1 conversion needs SM100+",
+)
 
 HEAD_DIM = 128
 NUM_HEADS = 32
@@ -336,6 +348,7 @@ def _dsa_caches(packed: bool, num_blocks: int) -> tuple[torch.Tensor, torch.Tens
     ), index
 
 
+@requires_native_fp8
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("num_tokens", [1, 7, 300])
 @torch.inference_mode()
@@ -403,7 +416,13 @@ def test_fused_prologue_matches_unfused(packed: bool, num_tokens: int):
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("use_fp4_cache", [False, True])
+@pytest.mark.parametrize(
+    "use_fp4_cache",
+    [
+        pytest.param(False, marks=requires_native_fp8),
+        pytest.param(True, marks=requires_mxfp4),
+    ],
+)
 def test_fused_prologue_without_caches(use_fp4_cache: bool):
     """Profile / dummy runs: norms only, no cache access."""
     qkv = torch.randn(3, Q_LORA + KV_LORA + ROPE, dtype=torch.bfloat16, device="cuda")
@@ -520,6 +539,7 @@ def _index_k_inputs(num_tokens: int):
     return num_blocks, k, weight, bias, 1e-6, slots.to(torch.int64)
 
 
+@requires_mxfp4
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("num_tokens", [1, 7, 300])
 @torch.inference_mode()
@@ -544,6 +564,7 @@ def test_k_norm_quant_insert_mxfp4(packed: bool, num_tokens: int):
     assert torch.all(topk[num_tokens:] == 7)
 
 
+@requires_mxfp4
 @pytest.mark.parametrize("num_heads", [NUM_HEADS, 20])
 @pytest.mark.parametrize("num_tokens", [1, 33, 1100])
 @torch.inference_mode()
@@ -582,6 +603,7 @@ def test_q_quant_mxfp4(num_heads: int, num_tokens: int):
         assert torch.count_nonzero(weights[:, num_heads:]) == 0
 
 
+@requires_mxfp4
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("num_tokens", [7, 300])
 @torch.inference_mode()
@@ -625,6 +647,7 @@ def test_fused_prologue_mxfp4_index_cache(packed: bool, num_tokens: int):
     assert torch.all(topk == -1)
 
 
+@requires_mxfp4
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("num_tokens", [1, 7, 300, 4100])
 @torch.inference_mode()
