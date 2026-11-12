@@ -143,6 +143,9 @@ def _get_backend_priorities(
                 sparse_tail.insert(0, flashinfer_sparse)
             else:
                 sparse_tail.append(flashinfer_sparse)
+            if device_capability.major == 8:
+                # The sparse backends above all need SM90 or newer.
+                sparse_tail.append(AttentionBackendEnum.TRITON_MLA_SPARSE)
             return [
                 AttentionBackendEnum.FLASH_ATTN_MLA,
                 AttentionBackendEnum.FLASHMLA,
