@@ -769,8 +769,8 @@ class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
     @classmethod
     def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         """Default the kv-cache dtype when the text backbone carries DSA:
-        per-tensor fp8 for FLASHINFER_MLA_SPARSE, the default on SM10x, and
-        "fp8_ds_mla" otherwise."""
+        per-tensor fp8 for FLASHINFER_MLA_SPARSE, the default on SM10x, BF16
+        for TRITON_MLA_SPARSE on SM8x, and "fp8_ds_mla" otherwise."""
         hf_config = vllm_config.model_config.hf_config
         # Multimodal composite configs carry dsa_config on text_config;
         # text-only models have it at the top level.
@@ -790,6 +790,14 @@ class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
             # FlashInfer reads per-tensor fp8 MLA rows, not the ds_mla formats.
             if cache_config.cache_dtype == "auto":
                 cache_config.cache_dtype = "fp8_e4m3"
+        elif (
+            cache_config.cache_dtype == "auto"
+            and backend in (None, AttentionBackendEnum.TRITON_MLA_SPARSE)
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability_family(80)
+        ):
+            # TRITON_MLA_SPARSE, the only sparse MLA backend on SM8x, reads BF16 rows.
+            cache_config.cache_dtype = "bfloat16"
         elif cache_config.cache_dtype == "auto" or cache_config.cache_dtype.startswith(
             "fp8"
         ):
