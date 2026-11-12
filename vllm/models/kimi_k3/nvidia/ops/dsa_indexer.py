@@ -8,16 +8,35 @@ The quant helpers and `dsa_fused_prologue` follow `fused_norm_rope` in
 model does not depend on another model's private kernels.
 """
 
+import functools
+
 import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
 from vllm.v1.attention.ops.common import pack_ue8m0_x4
+from vllm.v1.attention.ops.fp8_e4m3_portable import (
+    float_to_e4m3_bytes,
+    has_native_fp8e4nv,
+)
+from vllm.v1.attention.ops.fp8e4nv import FP8E4NV_EXTERN_LIBS
 
 _FP8_DTYPE = current_platform.fp8_dtype()
 _USE_FNUZ = torch.float8_e4m3fnuz == _FP8_DTYPE
 _FP8_MAX = 224.0 if _USE_FNUZ else 448.0
+
+
+@functools.cache
+def _native_fp8() -> bool:
+    """False on CUDA GPUs older than SM89, where Triton cannot lower
+    `fp8e4nv`: the key insert and the query quant then encode E4M3 in software
+    and store the bytes through uint8 pointers."""
+    return _USE_FNUZ or has_native_fp8e4nv()
+
+
+def _fp8_launch_kwargs() -> dict:
+    return {} if _native_fp8() else {"extern_libs": FP8E4NV_EXTERN_LIBS}
 
 
 @triton.jit
@@ -50,6 +69,7 @@ def _index_k_insert(
     MX_SCALE: tl.constexpr,
     FP8_MAX: tl.constexpr,
     USE_FNUZ: tl.constexpr,
+    NATIVE_FP8: tl.constexpr,
 ):
     # Padded rows and (under DCP) tokens owned by another rank have no slot.
     slot = tl.load(slot_mapping_ptr + tok, mask=tok < num_slots, other=-1)
@@ -66,8 +86,12 @@ def _index_k_insert(
 
         # Same math as the CUDA indexer_k_quant_and_cache kernel.
         scale = _ue8m0_scale(tl.max(tl.abs(y), axis=0), 1e-4, FP8_MAX)
-        fp8_dtype = tl.float8e4b8 if USE_FNUZ else tl.float8e4nv
-        y_fp8 = tl.div_rn(y, scale).to(fp8_dtype)
+        if NATIVE_FP8:
+            fp8_dtype = tl.float8e4b8 if USE_FNUZ else tl.float8e4nv
+            y_fp8 = tl.div_rn(y, scale).to(fp8_dtype)
+        else:
+            # E4M3 bytes; `cache_ptr` is a uint8 pointer.
+            y_fp8 = float_to_e4m3_bytes(tl.div_rn(y, scale), False)
 
         # Block layout: [block_size x HEAD_DIM fp8 values | block_size x 4B scale].
         block_start = (slot // cache_block_size) * cache_block_stride
@@ -100,6 +124,7 @@ def _indexer_k_norm_quant_insert_kernel(
     MX_SCALE: tl.constexpr,
     FP8_MAX: tl.constexpr,
     USE_FNUZ: tl.constexpr,
+    NATIVE_FP8: tl.constexpr,
 ):
     tok = tl.program_id(0).to(tl.int64)
     if tl.program_id(1) == 1:
@@ -122,6 +147,7 @@ def _indexer_k_norm_quant_insert_kernel(
             MX_SCALE,
             FP8_MAX,
             USE_FNUZ,
+            NATIVE_FP8,
         )
 
 
@@ -151,6 +177,7 @@ def indexer_k_norm_quant_insert(
     mx_scale = mqa_logits_use_mx_scales()
     u8_cache = kv_cache.view(torch.uint8)
     topk = topk_indices_buffer.shape[-1]
+    native_fp8 = _native_fp8()
     _indexer_k_norm_quant_insert_kernel[(num_tokens, 2)](
         k,
         k.stride(0),
@@ -159,7 +186,7 @@ def indexer_k_norm_quant_insert(
         norm_eps,
         slot_mapping,
         slot_mapping.shape[0],
-        u8_cache.view(_FP8_DTYPE),
+        u8_cache.view(_FP8_DTYPE) if native_fp8 else u8_cache,
         u8_cache.view(torch.int32 if mx_scale else torch.float32),
         u8_cache.shape[1],
         u8_cache.stride(0),
@@ -171,7 +198,9 @@ def indexer_k_norm_quant_insert(
         MX_SCALE=mx_scale,
         FP8_MAX=_FP8_MAX,
         USE_FNUZ=_USE_FNUZ,
+        NATIVE_FP8=native_fp8,
         num_warps=1,
+        **_fp8_launch_kwargs(),
     )
 
 
@@ -191,6 +220,7 @@ def _indexer_q_quant_fold_weights_kernel(
     HEAD_DIM: tl.constexpr,
     FP8_MAX: tl.constexpr,
     USE_FNUZ: tl.constexpr,
+    NATIVE_FP8: tl.constexpr,
 ):
     tok = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1)
@@ -198,8 +228,13 @@ def _indexer_q_quant_fold_weights_kernel(
     q = tl.load(q_ptr + tok * q_stride0 + head * q_stride1 + offs).to(tl.float32)
     # Same math as per_token_group_quant_fp8(use_ue8m0=True) (eps=1e-10).
     scale = _ue8m0_scale(tl.max(tl.abs(q), axis=0), 1e-10, FP8_MAX)
-    fp8_dtype = tl.float8e4b8 if USE_FNUZ else tl.float8e4nv
-    q_fp8 = tl.clamp(tl.div_rn(q, scale), -FP8_MAX, FP8_MAX).to(fp8_dtype)
+    q_scaled = tl.clamp(tl.div_rn(q, scale), -FP8_MAX, FP8_MAX)
+    if NATIVE_FP8:
+        fp8_dtype = tl.float8e4b8 if USE_FNUZ else tl.float8e4nv
+        q_fp8 = q_scaled.to(fp8_dtype)
+    else:
+        # E4M3 bytes; `q_fp8_ptr` is a uint8 pointer.
+        q_fp8 = float_to_e4m3_bytes(q_scaled, False)
     tl.store(q_fp8_ptr + tok * q_fp8_stride0 + head * q_fp8_stride1 + offs, q_fp8)
     w = tl.load(w_ptr + tok * w_stride + head).to(tl.float32)
     tl.store(w_out_ptr + tok * w_out_stride + head, w * scale * weight_scale)
@@ -233,13 +268,14 @@ def indexer_q_quant_fold_weights(
     )
     if num_tokens == 0:
         return q_fp8, weights
+    native_fp8 = _native_fp8()
     _indexer_q_quant_fold_weights_kernel[(num_tokens, num_heads)](
         index_q,
         index_q.stride(0),
         index_q.stride(1),
         index_weights,
         index_weights.stride(0),
-        q_fp8,
+        q_fp8 if native_fp8 else q_fp8.view(torch.uint8),
         q_fp8.stride(0),
         q_fp8.stride(1),
         weights,
@@ -248,7 +284,9 @@ def indexer_q_quant_fold_weights(
         HEAD_DIM=head_dim,
         FP8_MAX=_FP8_MAX,
         USE_FNUZ=_USE_FNUZ,
+        NATIVE_FP8=native_fp8,
         num_warps=1,
+        **_fp8_launch_kwargs(),
     )
     return q_fp8, weights
 
@@ -329,6 +367,7 @@ def _dsa_fused_prologue_kernel(
             MX_SCALE,
             FP8_MAX,
             USE_FNUZ,
+            True,  # NATIVE_FP8: this kernel also writes fp8_ds_mla natively
         )
     elif pid == 1:
         # The normed row is written for every token (the prefill path reads it).

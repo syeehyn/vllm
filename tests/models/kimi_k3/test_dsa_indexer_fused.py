@@ -17,6 +17,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 from vllm.model_executor.layers.sparse_attn_indexer import kv_cache_as_quant_view
 from vllm.models.kimi_k3.nvidia.dsa import KimiK3DSAIndexer
 from vllm.models.kimi_k3.nvidia.ops.dsa_indexer import (
+    _native_fp8,
     dsa_fused_prologue,
     indexer_k_norm_quant_insert,
     indexer_q_quant_fold_weights,
@@ -178,6 +179,136 @@ def test_q_quant_fold_weights_matches_unfused(num_heads: int, num_tokens: int):
     if padded != num_heads:
         assert torch.count_nonzero(q_fp8[:, num_heads:].view(torch.uint8)) == 0
         assert torch.count_nonzero(weights[:, num_heads:]) == 0
+
+
+# ---------------------------------------------------------------------------
+# FP8 bytes against torch casts. Triton has no fp8e4nv below SM89, where the
+# Q quant and the key insert encode E4M3 in software; SM89+ runs the same
+# checks on the native casts.
+# ---------------------------------------------------------------------------
+
+
+def _spread_bf16(*shape: int) -> torch.Tensor:
+    """bf16 values over 24 binades: divided by their row's scale they cover
+    E4M3's normals, subnormals and underflow to zero, and their 8-bit
+    mantissas land on E4M3 rounding ties."""
+    x = torch.randn(shape, device="cuda")
+    x = x * torch.exp2(torch.randint(-24, 1, shape, device="cuda").float())
+    return x.to(torch.bfloat16)
+
+
+def _assert_ue8m0_scale(scale: torch.Tensor, amax: torch.Tensor, floor: float):
+    """`scale` is the smallest power of two >= `max(amax, floor) / 448`.
+    Twice that is accepted where the ratio is itself a power of two: which
+    one is written is log2's rounding, not the FP8 encoding under test."""
+    ratio = amax.clamp(min=floor) / 448.0
+    assert torch.all((scale.view(torch.int32) & 0x7FFFFF) == 0)
+    assert torch.all((scale >= ratio) & (scale <= 2 * ratio))
+
+
+def _fp8_bytes_ref(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """`x` [N, D] fp32 over its power-of-two `scale` [N] (an exact division)
+    as E4M3 bytes."""
+    return (x / scale[:, None]).to(torch.float8_e4m3fn).view(torch.uint8)
+
+
+@pytest.mark.parametrize("head_dim", [HEAD_DIM, 64])
+@pytest.mark.parametrize("num_heads", [NUM_HEADS, 20])
+@torch.inference_mode()
+def test_q_quant_matches_torch_fp8_cast(head_dim: int, num_heads: int):
+    """The Q quant, shared by the fused and unfused key paths. head_dim 128
+    takes the software codec's packed conversion, 64 its scalar one."""
+    assert _native_fp8() == current_platform.has_device_capability(89)
+    torch.manual_seed(0)
+    num_tokens = 257
+    q = _spread_bf16(num_tokens, num_heads, head_dim)
+    q[0, 0].zero_()  # all-zero group: exercises the amax floor
+    q[1, 0, 0] = -0.0
+    kw = torch.ones(
+        num_tokens, head_dim + num_heads, dtype=torch.bfloat16, device="cuda"
+    )
+    # Unit weights and weight scale return each head's scale as its weight.
+    q_fp8, weights = indexer_q_quant_fold_weights(q, kw[:, head_dim:], 1.0, 32)
+
+    assert q_fp8.dtype == current_platform.fp8_dtype()
+    qf = q.float().cpu().reshape(-1, head_dim)
+    scale = weights[:, :num_heads].cpu().reshape(-1)
+    _assert_ue8m0_scale(scale, qf.abs().amax(dim=-1), 1e-10)
+    out = q_fp8.view(torch.uint8)[:, :num_heads].cpu().reshape(-1, head_dim)
+    assert torch.equal(out, _fp8_bytes_ref(qf, scale))
+    assert torch.count_nonzero(q_fp8.view(torch.uint8)[:, num_heads:]) == 0
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("fused", [True, False])
+@torch.inference_mode()
+def test_k_insert_matches_torch_fp8_cast(fused: bool, packed: bool):
+    """Both key writers store `(y / scale).to(float8_e4m3fn)`: the fused
+    LayerNorm insert (index_k_norm_type="layernorm" without index RoPE) and
+    the op's `indexer_k_quant_and_cache` (every other config), on the cache
+    layouts of `_make_cache`."""
+    assert _native_fp8() == current_platform.has_device_capability(89)
+    torch.manual_seed(0)
+    group, num_groups, num_blocks = 25, 6, 5
+    num_tokens = group * num_groups
+    slots = torch.randperm(num_blocks * BLOCK, device="cuda")[:num_tokens]
+    slots[1] = -1  # padded token
+    raw, view = _make_cache(packed, num_blocks)
+
+    if fused:
+        # A zero LayerNorm weight makes the normed key the bias exactly, in
+        # any reduction order: each launch writes one known row to its slots.
+        y = _spread_bf16(num_groups, HEAD_DIM).float()
+        y[0] *= 2.0**-20  # below the amax floor
+        weight = torch.zeros(HEAD_DIM, dtype=torch.float32, device="cuda")
+        for i in range(num_groups):
+            # One more row than slots (cudagraph padding).
+            k = torch.randn(
+                group + 1, HEAD_DIM + NUM_HEADS, dtype=torch.bfloat16, device="cuda"
+            )[:, :HEAD_DIM]
+            topk = torch.zeros(group + 1, TOPK, dtype=torch.int32, device="cuda")
+            indexer_k_norm_quant_insert(
+                k,
+                weight,
+                y[i],
+                1e-6,
+                slots[i * group : (i + 1) * group],
+                view,
+                topk,
+                group + 1,
+            )
+            assert torch.all(topk == -1)
+        y = y.repeat_interleave(group, dim=0)
+    else:
+        k = _spread_bf16(num_tokens, HEAD_DIM)
+        k[0] *= 2.0**-20  # below the amax floor
+        ops.indexer_k_quant_and_cache(
+            k,
+            view,
+            slots,
+            HEAD_DIM,
+            "mxfp8" if mqa_logits_use_mx_scales() else "ue8m0",
+        )
+        y = k.float()
+
+    slots = slots.cpu()
+    y = y.cpu()[slots >= 0]
+    slots = slots[slots >= 0]
+    # Block layout: [BLOCK x HEAD_DIM fp8 values | BLOCK x 4B scale].
+    pages = view.reshape(num_blocks, -1).cpu()
+    out = pages[:, : BLOCK * HEAD_DIM].reshape(-1, HEAD_DIM)[slots]
+    scale_bytes = pages[:, BLOCK * HEAD_DIM :].reshape(-1, 4)[slots]
+    if mqa_logits_use_mx_scales():
+        # Four equal UE8M0 bytes: the exponent of the power-of-two scale.
+        assert torch.all(scale_bytes == scale_bytes[:, :1])
+        scale = (scale_bytes[:, 0].to(torch.int32) << 23).view(torch.float32)
+    else:
+        scale = scale_bytes.view(torch.float32).view(-1)
+    _assert_ue8m0_scale(scale, y.abs().amax(dim=-1), 1e-4)
+    assert torch.equal(out, _fp8_bytes_ref(y, scale))
+    # Nothing else is written: not the other slots, nor (packed) the MLA section.
+    written = torch.count_nonzero(out) + torch.count_nonzero(scale_bytes)
+    assert int(torch.count_nonzero(raw)) == int(written)
 
 
 Q_LORA = 1536
