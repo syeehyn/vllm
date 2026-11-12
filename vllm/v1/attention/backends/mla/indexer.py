@@ -919,6 +919,15 @@ def dense_logits_rows(max_seqlen_k: int, max_logits_bytes: int | None = None) ->
     return max(1, max_logits_bytes // (4 * max(1, max_seqlen_k)))
 
 
+def use_triton_mqa_logits() -> bool:
+    """Whether the indexer scores with the Triton MQA logits kernels: DeepGEMM
+    has no kernels for CUDA devices below SM90."""
+    if not current_platform.is_cuda():
+        return False
+    capability = current_platform.get_device_capability()
+    return capability is not None and capability.major < 9
+
+
 def _supports_varlen_paged_mqa_logits() -> bool:
     return (
         current_platform.is_cuda()
@@ -1836,8 +1845,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 seq_lens = seq_lens.unsqueeze(-1)
 
             # DeepGEMM is required for the paged MQA logits on CUDA devices
+            # it has kernels for; the Triton ones take no schedule.
             schedule_metadata = self.scheduler_metadata_buffer
-            if current_platform.is_cuda() and has_deep_gemm():
+            if (
+                current_platform.is_cuda()
+                and has_deep_gemm()
+                and not use_triton_mqa_logits()
+            ):
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.num_states,
@@ -1920,7 +1934,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             decode.seq_lens.view(-1).copy_(metadata.seq_lens)
         decode.decode_lens.fill_(1)
 
-        if current_platform.is_cuda() and has_deep_gemm():
+        if (
+            current_platform.is_cuda()
+            and has_deep_gemm()
+            and not use_triton_mqa_logits()
+        ):
             schedule_metadata = get_paged_mqa_logits_metadata(
                 decode.seq_lens,
                 self.kv_cache_spec.num_states,

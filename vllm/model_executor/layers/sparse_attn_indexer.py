@@ -69,8 +69,13 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepSeekV32IndexerDecodeMetadata,
     DeepseekV32IndexerMetadata,
     dense_logits_rows,
+    use_triton_mqa_logits,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.mqa_logits_triton import (
+    fp8_mqa_logits_triton,
+    fp8_paged_mqa_logits_triton,
+)
 from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -729,6 +734,12 @@ def sparse_attn_indexer(
     # fill.
     if not skip_topk_buffer_clear:
         topk_indices_buffer[: hidden_states.shape[0]] = -1
+    triton_logits = use_triton_mqa_logits()
+    if triton_logits:
+        assert not use_fp4_cache, "Triton MQA logits read FP8 Q and K only"
+        assert dcp_world_size == 1 and not use_pcp, (
+            "Triton MQA logits do not support DCP or PCP"
+        )
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
@@ -880,6 +891,18 @@ def sparse_attn_indexer(
                         )
                         row_starts = cu_seqlen_ks[rows]
                         row_ends = cu_seqlen_ke[rows]
+                    elif triton_logits:
+                        # Compressed like DeepGEMM's: row i starts at column 0.
+                        logits = fp8_mqa_logits_triton(
+                            q_slice_cast[rows],
+                            (k_quant_cast, k_scale_cast),
+                            prefill_weights[tokens],
+                            cu_seqlen_ks[rows],
+                            cu_seqlen_ke[rows],
+                            clean_logits=False,
+                            max_seqlen_k=chunk.max_seqlen_k,
+                        )
+                        row_ends = cu_seqlen_ke[rows] - cu_seqlen_ks[rows]
                     else:
                         q_scale_rows, chunk_weights = mqa_logits_mx_inputs(
                             q_slice_cast[rows],
@@ -1010,6 +1033,14 @@ def sparse_attn_indexer(
                 padded_q_scale = pack_seq_triton(
                     q_scale[:num_decode_tokens], decode_lens, pad_value=0
                 )
+            elif triton_logits:
+                # Triton below SM89 has no FP8 pointer type: pack the bytes.
+                padded_q_quant_decode_tokens = pack_seq_triton(
+                    q_quant[:num_decode_tokens].view(torch.uint8),
+                    decode_lens,
+                    pad_value=0,
+                ).view(q_quant.dtype)
+                padded_q_scale = None
             else:
                 padded_q_quant_decode_tokens = pack_seq_triton(
                     q_quant[:num_decode_tokens], decode_lens
@@ -1089,6 +1120,26 @@ def sparse_attn_indexer(
                 decode_metadata.block_table,
                 decode_metadata.schedule_metadata,
                 max_model_len,
+            )
+        elif triton_logits:
+            decode_weights = weights[:num_padded_tokens]
+            if needs_padded_path:
+                # Row b * next_n + j scores request b's j-th token.
+                decode_weights = pack_seq_triton(
+                    weights[:num_decode_tokens].contiguous(),
+                    decode_lens,
+                    pad_value=0.0,
+                ).flatten(0, 1)
+            # The top-k reads each row up to its seq_len: size the logits to
+            # this batch rather than max_model_len.
+            logits = fp8_paged_mqa_logits_triton(
+                padded_q_quant_cast,
+                kv_cache,
+                decode_weights,
+                seq_lens,
+                decode_metadata.block_table,
+                max_model_len=attn_metadata_narrowed.max_seq_len,
+                clean_logits=False,
             )
         else:
             padded_q_scale, decode_weights = mqa_logits_mx_inputs(
@@ -1297,7 +1348,13 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         self.pcp_shard_decode_requests = parallel_config.pcp_shard_decode_requests
-        if current_platform.is_cuda() and not has_deep_gemm():
+        triton_logits = use_triton_mqa_logits()
+        if triton_logits:
+            logger.info_once(
+                "DeepGEMM has no kernels for this CUDA architecture; the sparse "
+                "indexer uses the Triton MQA logits kernels."
+            )
+        elif current_platform.is_cuda() and not has_deep_gemm():
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
                 "the current vLLM environment."
@@ -1309,10 +1366,11 @@ class SparseAttnIndexer(CustomOp):
                 _UNPACK_SEQ_TRITON_KERNEL,
             )
 
-            pack_dtype = torch.uint8 if use_fp4_cache else current_platform.fp8_dtype()
+            pack_bytes = use_fp4_cache or triton_logits
+            pack_dtype = torch.uint8 if pack_bytes else current_platform.fp8_dtype()
             _PACK_SEQ_TRITON_KERNEL.register_warmup(
                 dtype=pack_dtype,
-                pad_value=0 if use_fp4_cache else -float("inf"),
+                pad_value=0 if pack_bytes else -float("inf"),
             )
             _UNPACK_SEQ_TRITON_KERNEL.register_warmup()
 
