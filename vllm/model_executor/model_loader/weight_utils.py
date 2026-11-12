@@ -796,6 +796,24 @@ def filter_mm_encoder_only_safetensors_files(
     return kept
 
 
+def safetensors_files_with_used_weights(
+    hf_weights_files: list[str],
+    is_unused_weight: Callable[[str], bool],
+) -> list[str]:
+    """Return the safetensors shards holding at least one tensor that
+    `is_unused_weight` rejects. Only the shard headers are read.
+
+    Unlike `filter_safetensors_files_by_weight_name` the result is empty when
+    no shard holds a wanted tensor.
+    """
+    kept: list[str] = []
+    for st_file in hf_weights_files:
+        with safe_open(st_file, framework="pt") as f:
+            if not all(is_unused_weight(name) for name in f.keys()):  # noqa: SIM118
+                kept.append(st_file)
+    return kept
+
+
 def filter_safetensors_files_by_weight_name(
     hf_weights_files: list[str],
     is_unused_weight: Callable[[str], bool],
@@ -816,11 +834,7 @@ def filter_safetensors_files_by_weight_name(
         unchanged when no shard does.
 
     """
-    kept: list[str] = []
-    for st_file in hf_weights_files:
-        with safe_open(st_file, framework="pt") as f:
-            if not all(is_unused_weight(name) for name in f.keys()):  # noqa: SIM118
-                kept.append(st_file)
+    kept = safetensors_files_with_used_weights(hf_weights_files, is_unused_weight)
     if not kept:
         return hf_weights_files
     if len(kept) < len(hf_weights_files):
@@ -1097,13 +1111,25 @@ def safetensors_weights_iterator(
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
     shuffle_safetensors_files: bool = False,
+    is_unused_weight: Callable[[str], bool] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
     When *local_expert_ids* is provided, expert weights not belonging to
     this rank are skipped **before** reading from disk, which drastically
     reduces storage I/O for MoE models under EP.
+
+    When *is_unused_weight* is provided, tensors whose checkpoint name it
+    accepts are skipped the same way. Under pipeline parallelism this keeps a
+    rank from reading the other stages' layers out of a shard it shares with
+    them.
     """
+
+    def skip(name: str) -> bool:
+        return should_skip_weight(name, local_expert_ids) or (
+            is_unused_weight is not None and is_unused_weight(name)
+        )
+
     loading_desc = "Loading safetensors checkpoint shards"
     if safetensors_load_strategy == "eager":
         loading_desc += " (eager)"
@@ -1188,7 +1214,7 @@ def safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 state_dict = load(f.read())
             for name, param in state_dict.items():
-                if not should_skip_weight(name, local_expert_ids):
+                if not skip(name):
                     yield name, param
         elif safetensors_load_strategy == "torchao":
             # we can't load flattened torchao tensor subclasses directly into the model
@@ -1205,7 +1231,7 @@ def safetensors_weights_iterator(
             with safe_open(st_file, framework="pt") as f:
                 state_dict = {}
                 for name in f.keys():  # noqa: SIM118
-                    if should_skip_weight(name, local_expert_ids):
+                    if skip(name):
                         continue
                     state_dict[name] = f.get_tensor(name)
 
@@ -1223,7 +1249,7 @@ def safetensors_weights_iterator(
         else:
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
-                    if should_skip_weight(name, local_expert_ids):
+                    if skip(name):
                         continue
                     param = f.get_tensor(name)
                     yield name, param
