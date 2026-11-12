@@ -210,6 +210,19 @@ def _warmup_gemm_rs_ar() -> None:
         logger.info_once("Warmed up %d GEMM-RS/AR variants.", compiled)
 
 
+def _warmup_minimax_m3_msa(worker: "Worker") -> None:
+    # Model construction already imports the MiniMax-M3 model module. Avoid
+    # importing the warmup here so other models do not load the MSA kernels and
+    # the CuTe DSL their modules import.
+    if "vllm.models.minimax_m3.nvidia.model" not in sys.modules:
+        return
+    from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
+        minimax_m3_msa_warmup,
+    )
+
+    minimax_m3_msa_warmup(worker)
+
+
 def _autotune_kimi_k3_kda_qkvg(model: torch.nn.Module) -> None:
     module = sys.modules.get("vllm.models.kimi_k3.nvidia.low_latency_gemm")
     if module is not None:
@@ -338,11 +351,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
 
     if current_platform.is_cuda():
         # The MSA kernels, and the CuTe DSL their modules import, are CUDA-only.
-        from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
-            minimax_m3_msa_warmup,
-        )
-
-        minimax_m3_msa_warmup(worker)
+        _warmup_minimax_m3_msa(worker)
 
     # Allocate the exact decode-sized workspace, autotune cache misses, and
     # resolve every CUDA Graph bucket before capture begins.

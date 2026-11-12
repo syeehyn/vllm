@@ -184,9 +184,14 @@ def maybe_init_gemm_rs_ar(vllm_config: VllmConfig, use_sequence_parallel: bool) 
     enabled = envs.VLLM_KIMI_K3_GEMM_AR if all_reduce else envs.VLLM_ENABLE_GEMM_RS
     if not enabled:
         return False
+    if not current_platform.is_device_capability_family(100):
+        logger.warning_once(
+            "%s is disabled because the device is not SM100-family.", mode
+        )
+        return False
 
     # The kernel module pulls in cute_dsl, so import it only once the flag
-    # asks for it.
+    # asks for it and the device can run it.
     from vllm.model_executor.kernels.linear.cute_dsl.gemm_rs_ar import (
         maybe_init_gemm_rs_ar as maybe_init_shared_gemm_rs_ar,
     )
