@@ -123,7 +123,7 @@ def test_default_is_unchanged_off_cuda(monkeypatch):
     ),
     reason="needs an SM8x CUDA device",
 )
-def test_sm8x_default_kv_dtype_selects_triton_sparse():
+def test_sm8x_default_kv_dtype_selects_triton_sparse(default_vllm_config):
     """On the device itself, the default is a dtype the selector can serve."""
     cache_dtype = _k31_cache_dtype("auto")
     assert cache_dtype == "bfloat16"

@@ -181,7 +181,7 @@ def test_warmup_uses_serving_dtypes_and_indexer_shape(
 
 @requires_cuda
 @pytest.mark.parametrize("minor", [0, 6, 9])
-def test_sm8x_selects_triton_sparse_for_bf16_kv(minor: int):
+def test_sm8x_selects_triton_sparse_for_bf16_kv(default_vllm_config, minor: int):
     from vllm.platforms.cuda import CudaPlatform
 
     valid, _ = CudaPlatform.get_valid_backends(
