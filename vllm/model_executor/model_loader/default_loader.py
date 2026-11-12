@@ -25,8 +25,7 @@ from vllm.model_executor.model_loader.ep_weight_filter import (
     compute_local_expert_ids,
 )
 from vllm.model_executor.model_loader.pp_weight_filter import (
-    find_pp_layer_range,
-    get_pp_stage,
+    PPCheckpointWeightFilter,
     get_pp_stage_prefetch_split,
 )
 from vllm.model_executor.model_loader.weight_utils import (
@@ -90,12 +89,9 @@ class DefaultModelLoader(BaseModelLoader):
 
         is_unused_weight: Callable[[str], bool] | None = None
         """If defined, safetensors shards holding only weights whose checkpoint
-        name (before *prefix*) it accepts are not read. Under pipeline
-        parallelism, single tensors it accepts are not read either."""
-
-        pp_layer_range: tuple[int, int] | None = None
-        """The `[start, end)` decoder layers of this pipeline-parallel stage,
-        for the weight filter log line."""
+        name (before *prefix*) it accepts are not read. When it is the
+        `PPCheckpointWeightFilter` of one of several pipeline-parallel stages,
+        single tensors it accepts are not read either."""
 
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
@@ -307,16 +303,24 @@ class DefaultModelLoader(BaseModelLoader):
                     f"`{source.model_or_path}`; check language_model prefixes "
                     f"{self._encoder_only_lm_prefixes}"
                 )
-        # Per-tensor rule for the lazy safetensors iterator.
-        is_unused_tensor: Callable[[str], bool] | None = None
+        # Set when the shard list has been reduced to those of this
+        # pipeline-parallel stage; then also the per-tensor rule.
+        pp_stage_filter: PPCheckpointWeightFilter | None = None
         if source.is_unused_weight is not None and use_safetensors:
-            if get_pp_stage() is None:
-                hf_weights_files = filter_safetensors_files_by_weight_name(
-                    hf_weights_files, source.is_unused_weight
+            is_unused_weight = source.is_unused_weight
+            if (
+                isinstance(is_unused_weight, PPCheckpointWeightFilter)
+                and is_unused_weight.pp_size > 1
+            ):
+                hf_weights_files, pp_stage_filter = self._filter_pp_stage_files(
+                    is_unused_weight, hf_weights_files
                 )
             else:
-                hf_weights_files, is_unused_tensor = self._filter_pp_stage_files(
-                    source, hf_weights_files
+                # Any other rule (a drafter's, the default one) says nothing
+                # about stages: every rank keeps the same shards and they
+                # share the prefetch as before.
+                hf_weights_files = filter_safetensors_files_by_weight_name(
+                    hf_weights_files, is_unused_weight
                 )
         if self.load_config.load_format == "npcache":
             # Currently np_cache only support *.bin checkpoints
@@ -372,12 +376,12 @@ class DefaultModelLoader(BaseModelLoader):
                         shuffle_safetensors_files=(
                             self.load_config.shuffle_safetensors_files
                         ),
-                        is_unused_weight=is_unused_tensor,
-                        # The file list is this stage's alone, so only the
-                        # ranks of this stage can share its prefetch.
+                        is_unused_weight=pp_stage_filter,
+                        # The file list is then this stage's alone, so only
+                        # the ranks of this stage can share its prefetch.
                         prefetch_rank_and_world_size=(
                             get_pp_stage_prefetch_split()
-                            if is_unused_tensor is not None
+                            if pp_stage_filter is not None
                             else None
                         ),
                     )
@@ -404,8 +408,8 @@ class DefaultModelLoader(BaseModelLoader):
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
     def _filter_pp_stage_files(
-        self, source: Source, hf_weights_files: list[str]
-    ) -> tuple[list[str], Callable[[str], bool] | None]:
+        self, pp_filter: PPCheckpointWeightFilter, hf_weights_files: list[str]
+    ) -> tuple[list[str], PPCheckpointWeightFilter | None]:
         """Keep the safetensors shards this pipeline-parallel stage loads from.
 
         Returns the kept shards and the rule for skipping single tensors inside
@@ -413,55 +417,38 @@ class DefaultModelLoader(BaseModelLoader):
         `filter_safetensors_files_by_weight_name`, a rule that rejects every
         tensor of the source is not applied at all.
         """
-        pp_stage = get_pp_stage()
-        assert pp_stage is not None and source.is_unused_weight is not None
-        pp_rank, pp_size = pp_stage
-        kept = safetensors_files_with_used_weights(
-            hf_weights_files, source.is_unused_weight
-        )
+        kept = safetensors_files_with_used_weights(hf_weights_files, pp_filter)
         if not kept:
             return hf_weights_files, None
 
         def gib(files: list[str]) -> float:
             return sum(os.path.getsize(f) for f in files) / 1024**3
 
-        if source.pp_layer_range is not None:
-            layers = "layers [{}, {})".format(*source.pp_layer_range)
-        else:
-            layers = "layer range unknown"
         # One line per rank and source: the proof in a run log that this rank
         # reads only its own stage.
         logger.info(
-            "PP weight filter: pp rank %d of %d, %s: %d of %d safetensors "
-            "shards selected (%.2f GiB of %.2f GiB)",
-            pp_rank,
-            pp_size,
-            layers,
+            "PP weight filter: %s: %d of %d safetensors shards selected "
+            "(%.2f GiB of %.2f GiB)",
+            pp_filter.describe_stage(),
             len(kept),
             len(hf_weights_files),
             gib(kept),
             gib(hf_weights_files),
         )
-        return kept, source.is_unused_weight
+        return kept, pp_filter
 
     def get_all_weights(
         self,
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        is_unused_weight = getattr(model, "is_unused_checkpoint_weight", None)
         primary_weights = DefaultModelLoader.Source(
             model_config.model,
             model_config.revision,
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
-            is_unused_weight=is_unused_weight,
-            pp_layer_range=(
-                find_pp_layer_range(model)
-                if is_unused_weight is not None and get_pp_stage() is not None
-                else None
-            ),
+            is_unused_weight=getattr(model, "is_unused_checkpoint_weight", None),
         )
         yield from self._get_weights_iterator(primary_weights)
 

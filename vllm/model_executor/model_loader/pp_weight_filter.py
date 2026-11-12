@@ -4,8 +4,10 @@
 
 Under pipeline parallelism each rank builds only its own decoder layers; the
 others are `PPMissingLayer` placeholders, as are the embedding / final norm /
-LM head on the stages that do not own them. `load_weights` already drops the
-tensors of those placeholders, but only after the loader has read them. For a
+LM head on the stages that do not own them. A component the process does not
+run at all (e.g. the vision tower of a text-only deployment) is a
+`StageMissingLayer`. `load_weights` already drops the tensors of both kinds of
+placeholder, but only after the loader has read them. For a
 checkpoint on network storage that is most of the load time: every rank reads
 the whole model to keep 1/pp_size of it.
 
@@ -22,24 +24,6 @@ from torch import nn
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
-
-
-def get_pp_stage() -> tuple[int, int] | None:
-    """Return `(pp_rank, pp_size)` of this process, or `None` when it is not
-    one of several pipeline-parallel stages.
-
-    Read from the PP group, the source `make_layers` partitions by.
-    """
-    from vllm.distributed.parallel_state import get_pp_group
-
-    try:
-        pp_group = get_pp_group()
-    except AssertionError:
-        # The PP group is not initialized (offline tools, unit tests).
-        return None
-    if pp_group.world_size <= 1:
-        return None
-    return pp_group.rank_in_group, pp_group.world_size
 
 
 def get_pp_stage_prefetch_split() -> tuple[int, int]:
@@ -76,16 +60,22 @@ def find_pp_layer_range(model: nn.Module) -> tuple[int, int] | None:
 
 
 class PPCheckpointWeightFilter:
-    """Checkpoint-name predicate: True for weights of `PPMissingLayer` modules.
+    """Checkpoint-name predicate: True for weights of placeholder modules.
 
     The rule is read off the module tree instead of parsing layer indices out
     of names: a weight is unused iff, after *mapper* has turned its checkpoint
     name into a module path, one of its dotted prefixes names a
-    `PPMissingLayer`. That is the test `is_pp_missing_parameter` applies in
-    `load_weights`, so numbered containers that are not pipeline stages
-    (`experts.N`, vision tower blocks, projector layers) can never match, and
-    custom partitions (`VLLM_PP_LAYER_PARTITION`) are honoured because the
-    placeholders come from `make_layers`.
+    `PPMissingLayer` or `StageMissingLayer`. That is the test
+    `is_pp_missing_parameter` and `AutoWeightsLoader` apply in `load_weights`,
+    so numbered containers that are not pipeline stages (`experts.N`, vision
+    tower blocks, projector layers) can never match, and custom partitions
+    (`VLLM_PP_LAYER_PARTITION`) are honoured because the placeholders come
+    from `make_layers`.
+
+    The loader recognizes the rule by this type: the shards it keeps are this
+    stage's alone, so the loader also skips single tensors with it, splits the
+    prefetch among the stage's own ranks and logs the selection. The stage is
+    the one of the constructing process (`pp_rank` of `pp_size`).
 
     Only renames that keep a weight under the same module prefix may happen
     after *mapper* (e.g. `.q_proj` -> `.in_proj_qkvgfab` inside one decoder
@@ -103,26 +93,46 @@ class PPCheckpointWeightFilter:
     def __init__(self, model: nn.Module, mapper: WeightsMapper | None = None):
         # Not a registered submodule: bypass nn.Module bookkeeping when this
         # object is itself stored on *model*.
+        from vllm.distributed.parallel_state import get_pp_group
+
         self._model = model
         self._mapper = mapper
+        pp_group = get_pp_group()
+        self.pp_rank: int = pp_group.rank_in_group
+        self.pp_size: int = pp_group.world_size
         self._missing_modules: frozenset[str] | None = None
 
     @property
     def missing_modules(self) -> frozenset[str]:
-        """Module paths of the `PPMissingLayer` placeholders in the model."""
+        """Module paths of the placeholders in the model, the ones
+        `get_pp_missing_layer_names` collects."""
         if self._missing_modules is None:
-            from vllm.model_executor.models.utils import PPMissingLayer
+            from vllm.model_executor.models.utils import (
+                PPMissingLayer,
+                StageMissingLayer,
+            )
 
             self._missing_modules = frozenset(
                 name
                 for name, module in self._model.named_modules()
-                if name and isinstance(module, PPMissingLayer)
+                if name and isinstance(module, (PPMissingLayer, StageMissingLayer))
             )
         return self._missing_modules
 
     @property
     def layer_range(self) -> tuple[int, int] | None:
+        """The `[start, end)` decoder layers of this stage, if the model
+        records them."""
         return find_pp_layer_range(self._model)
+
+    def describe_stage(self) -> str:
+        """This stage, for the loader's log line."""
+        layer_range = self.layer_range
+        if layer_range is None:
+            layers = "layer range unknown"
+        else:
+            layers = "layers [{}, {})".format(*layer_range)
+        return f"pp rank {self.pp_rank} of {self.pp_size}, {layers}"
 
     def __call__(self, name: str) -> bool:
         missing = self.missing_modules
