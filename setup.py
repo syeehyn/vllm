@@ -1561,10 +1561,34 @@ if not _is_xpu():
 if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
-if _is_cuda():
+# Build switches for wheels that target only pre-SM90 GPUs. Both test presence,
+# not value, and CMakeLists.txt skips the same projects: a target listed here
+# but not configured there fails the build, so keep the two in step.
+# VLLM_SKIP_FLASH_ATTN drops FA2/FA3/FA4; VLLM_SM80_MINIMAL_BUILD drops the
+# external projects that only produce SM90+/SM100 kernels.
+SKIP_FLASH_ATTN = "VLLM_SKIP_FLASH_ATTN" in os.environ
+MINIMAL_SM80_BUILD = "VLLM_SM80_MINIMAL_BUILD" in os.environ
+
+
+def _targets_sm90() -> bool:
+    """Whether the requested CUDA architectures include SM90.
+
+    FA3 is Hopper-only: vllm-flash-attn gives its sources gencode flags only
+    when 9.0 is a target arch, and without them the FA3 target fails to
+    compile. Only an explicit numeric ``TORCH_CUDA_ARCH_LIST`` is inspected;
+    an unset or named list is resolved by torch's CMake and keeps FA3.
+    """
+    archs = re.findall(r"[^;,\s]+", os.environ.get("TORCH_CUDA_ARCH_LIST", ""))
+    numeric = all(re.fullmatch(r"\d+\.\d+[af]?(\+PTX)?", arch) for arch in archs)
+    if not archs or not numeric:
+        return True
+    return any(arch.startswith("9.0") for arch in archs)
+
+
+if _is_cuda() and not SKIP_FLASH_ATTN:
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
     if USE_PRECOMPILED_EXTENSIONS or (
-        CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
+        CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3") and _targets_sm90()
     ):
         # FA3 requires CUDA 12.3 or later
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
@@ -1573,6 +1597,7 @@ if _is_cuda():
     ext_modules.append(
         CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa4_cutedsl_C", optional=True)
     )
+if _is_cuda() and not MINIMAL_SM80_BUILD:
     if USE_PRECOMPILED_EXTENSIONS or (
         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.9")
     ):
@@ -1622,6 +1647,9 @@ package_data = {
     "vllm": [
         "py.typed",
         "libs/*.so*",
+        # Prebuilt LLVM bitcode for the software FP8 E4M3 codec used by the
+        # Triton kernels on GPUs without native fp8e4nv (pre-SM89).
+        "v1/attention/ops/fp8e4nv_helper_sm75.bc",
         "model_executor/layers/fused_moe/configs/*.json",
         # Tuned kernel configs must be explicit: the setuptools-scm git
         # file-finder is inactive when building from a .git-less tree

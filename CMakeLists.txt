@@ -1223,10 +1223,13 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   endif()
 
   # Fused MQA logits + top-k prefill kernel (SM100 family). It compiles against
-  # DeepGEMM's headers, so DeepGEMM is fetched here.
-  include(cmake/external_projects/deepgemm.cmake)
+  # DeepGEMM's headers, so DeepGEMM is fetched here. VLLM_SM80_MINIMAL_BUILD
+  # skips the fetch (and the _deep_gemm_C target) unless this kernel needs it.
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
     cuda_archs_loose_intersection(FUSED_MQA_TOPK_ARCHS "10.0f" "${CUDA_ARCHS}")
+  endif()
+  if(FUSED_MQA_TOPK_ARCHS OR NOT DEFINED ENV{VLLM_SM80_MINIMAL_BUILD})
+    include(cmake/external_projects/deepgemm.cmake)
   endif()
   if(FUSED_MQA_TOPK_ARCHS)
     set(FUSED_MQA_TOPK_SRC "csrc/fused_mqa_topk/fused_mqa_topk.cu")
@@ -1863,13 +1866,24 @@ if (VLLM_GPU_LANG STREQUAL "CUDA"
 endif()
 
 # For CUDA we also build and ship some external projects.
+# VLLM_SM80_MINIMAL_BUILD and VLLM_SKIP_FLASH_ATTN (presence, not value) skip
+# them; setup.py drops the matching extensions, so keep the two in step.
 if (VLLM_GPU_LANG STREQUAL "CUDA")
-    include(cmake/external_projects/deepselect.cmake)
-    include(cmake/external_projects/fmha_sm100.cmake)
-    include(cmake/external_projects/flashmla.cmake)
-    include(cmake/external_projects/flashkda.cmake)
-    include(cmake/external_projects/tml_fa4.cmake)
+    if(NOT DEFINED ENV{VLLM_SM80_MINIMAL_BUILD})
+        include(cmake/external_projects/deepselect.cmake)
+        include(cmake/external_projects/fmha_sm100.cmake)
+        include(cmake/external_projects/flashmla.cmake)
+        include(cmake/external_projects/flashkda.cmake)
+        include(cmake/external_projects/tml_fa4.cmake)
+    else()
+        message(STATUS "Skipping SM90+/SM100 external projects "
+          "(VLLM_SM80_MINIMAL_BUILD is set)")
+    endif()
 
     # vllm-flash-attn should be last as it overwrites some CMake functions
-    include(cmake/external_projects/vllm_flash_attn.cmake)
+    if(NOT DEFINED ENV{VLLM_SKIP_FLASH_ATTN})
+        include(cmake/external_projects/vllm_flash_attn.cmake)
+    else()
+        message(STATUS "Skipping vllm-flash-attn (VLLM_SKIP_FLASH_ATTN is set)")
+    endif()
 endif ()
