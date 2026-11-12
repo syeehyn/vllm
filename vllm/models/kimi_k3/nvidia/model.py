@@ -1507,21 +1507,32 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
 def _pp_checkpoint_weight_filter(
     model: nn.Module, mapper: WeightsMapper | None = None
-) -> PPCheckpointWeightFilter | None:
-    """Under pipeline parallelism, the `is_unused_checkpoint_weight` of *model*:
+) -> PPCheckpointWeightFilter:
+    """The `is_unused_checkpoint_weight` of *model* under pipeline parallelism:
     it rejects the checkpoint weights of the other stages.
 
     The loader then never opens the shards of other stages' decoder layers and
     reads, from the shards it does open, only this stage's tensors. The rule is
-    the `PPMissingLayer` test that `load_weights` applies after the read, so
-    the embedding, final norm, AttnRes output head and LM head still load on
-    the stages that own them, and the vision tower and projector on all.
+    the placeholder test that `load_weights` applies after the read, so the
+    embedding, final norm, AttnRes output head and LM head still load on the
+    stages that own them, and the vision tower and projector wherever they are
+    built.
 
-    With a single stage there is none: the model has no shard rule, as before.
+    Raises:
+        AttributeError: With a single stage. The model then has no
+            `is_unused_checkpoint_weight`, as before, and the loader reads the
+            checkpoint as it always did.
+
     """
-    if get_pp_group().world_size > 1:
-        return PPCheckpointWeightFilter(model, mapper)
-    return None
+    if get_pp_group().world_size == 1:
+        raise AttributeError("is_unused_checkpoint_weight")
+    # One filter per model: it caches the placeholder paths. Kept out of
+    # nn.Module's attribute bookkeeping.
+    pp_filter = model.__dict__.get("_pp_checkpoint_weight_filter")
+    if pp_filter is None:
+        pp_filter = PPCheckpointWeightFilter(model, mapper)
+        model.__dict__["_pp_checkpoint_weight_filter"] = pp_filter
+    return pp_filter
 
 
 class KimiLinearForCausalLM(
@@ -1533,8 +1544,11 @@ class KimiLinearForCausalLM(
     SupportsEagle3,
     SupportsReplaySSM,
 ):
-    # Set per instance under pipeline parallelism only.
-    is_unused_checkpoint_weight: Callable[[str], bool]
+    @property
+    def is_unused_checkpoint_weight(self) -> Callable[[str], bool]:
+        """Defined under pipeline parallelism only, where it rejects the other
+        stages' weights; see `_pp_checkpoint_weight_filter`."""
+        return _pp_checkpoint_weight_filter(self)
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1567,9 +1581,6 @@ class KimiLinearForCausalLM(
         # The final norm is applied in compute_logits unless the specialized decode
         # applies it in forward.
         self.needs_norm_in_logits = True
-        pp_weight_filter = _pp_checkpoint_weight_filter(self)
-        if pp_weight_filter is not None:
-            self.is_unused_checkpoint_weight = pp_weight_filter
 
     def build_specialized_decode(self) -> None:
         from .specialized_decode.runtime.decode import SpecializedDecode
@@ -1723,8 +1734,6 @@ class KimiK3ForConditionalGeneration(
 
     supports_encoder_tp_data = True
     supports_mm_device_do_normalize = True
-    # Set per instance under pipeline parallelism only.
-    is_unused_checkpoint_weight: Callable[[str], bool]
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -1827,9 +1836,13 @@ class KimiK3ForConditionalGeneration(
             self.language_model.make_empty_intermediate_tensors
         )
         self.media_placeholder: int = self.config.media_placeholder_token_id
-        pp_weight_filter = _pp_checkpoint_weight_filter(self, self.hf_to_vllm_mapper)
-        if pp_weight_filter is not None:
-            self.is_unused_checkpoint_weight = pp_weight_filter
+
+    @property
+    def is_unused_checkpoint_weight(self) -> Callable[[str], bool]:
+        """Defined under pipeline parallelism only, where it rejects the other
+        stages' weights; see `_pp_checkpoint_weight_filter`. It takes the names
+        of the checkpoint, before `hf_to_vllm_mapper`."""
+        return _pp_checkpoint_weight_filter(self, self.hf_to_vllm_mapper)
 
     def process_weights_after_loading(self) -> None:
         self.language_model.process_weights_after_loading()
