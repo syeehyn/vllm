@@ -4,8 +4,8 @@
 
 Compares split-KV against the single-pass (`num_kv_splits=1`) path
 produced by the same kernel — both paths must agree to within bf16 ULPs.
-Flat rows past the int32 element-offset range are compared against a float64
-reference.
+Both paths, and flat rows past the int32 element-offset range, are compared
+against a float64 reference.
 """
 
 import pytest
@@ -18,10 +18,7 @@ from vllm.v1.attention.ops.triton_mla_sparse_kernel import (
     triton_mla_sparse_attention,
 )
 
-pytestmark = pytest.mark.skipif(
-    not current_platform.is_cuda_alike(),
-    reason="Triton sparse MLA kernel requires CUDA/ROCm",
-)
+pytestmark = pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
 
 
 @pytest.fixture(scope="module")
@@ -95,6 +92,39 @@ def test_auto_split_matches_single_pass(num_tokens, kv_cache):
         num_kv_splits=None,
         kv_cache=kv_cache,
     )
+
+
+@pytest.mark.parametrize("num_heads", [12, 96])
+@pytest.mark.parametrize("num_kv_splits", [1, 2, 16])
+def test_matches_float64_reference(num_heads, num_kv_splits, kv_cache):
+    """The single pass and the split-KV merge against independent math, at
+    the K3.1 head counts (12 per rank at TP8, fewer than one head tile) and
+    with the -1 tail the indexer pads short contexts with."""
+    torch.manual_seed(0)
+    topk, sm_scale = 2048, 0.1
+    num_valid = torch.tensor([1, 100, 1500, topk], device="cuda")
+    num_tokens = num_valid.shape[0]
+    q = torch.randn(num_tokens, num_heads, _DIM_QK, dtype=torch.bfloat16, device="cuda")
+    indices = torch.randint(
+        0, kv_cache.shape[0], (num_tokens, 1, topk), dtype=torch.int32, device="cuda"
+    )
+    padded = torch.arange(topk, device="cuda") >= num_valid[:, None, None]
+    indices.masked_fill_(padded, -1)
+
+    rows = kv_cache[indices[:, 0].clamp(min=0).long(), 0].double()
+    scores = q.double() @ rows.transpose(1, 2) * sm_scale
+    probs = scores.masked_fill(padded, float("-inf")).softmax(dim=-1)
+    values = rows[..., :_BLOCK_DV]
+    ref = probs @ values
+
+    out = triton_mla_sparse_attention(
+        q, kv_cache, indices, sm_scale=sm_scale, num_kv_splits=num_kv_splits
+    )
+    # BF16 rounds each probability before the PV product, and the output: half
+    # an ulp, 2**-8 relative, each. The rest is fp32 rounding.
+    bound = 2**-8 * (probs @ values.abs() + ref.abs()) + 2e-3
+    error = (out.double() - ref).abs()
+    assert (error <= bound).all(), f"max error {error.max()} over the BF16 bound"
 
 
 @pytest.mark.parametrize("num_kv_splits", [1, 2, 4, 8])
