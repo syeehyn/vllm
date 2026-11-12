@@ -24,7 +24,7 @@ def test_msa_warmup_is_not_imported_for_other_models(monkeypatch) -> None:
 
 
 def test_msa_warmup_runs_for_a_minimax_m3_model(monkeypatch) -> None:
-    calls = []
+    calls: list[object] = []
     monkeypatch.setitem(sys.modules, _MODEL, SimpleNamespace())
     monkeypatch.setitem(
         sys.modules, _WARMUP, SimpleNamespace(minimax_m3_msa_warmup=calls.append)
