@@ -642,6 +642,12 @@ def sparse_attn_indexer(
             * round_up(max_model_len, row_align)
             * (logits_dtype.itemsize + decode_copy_bytes),
         )
+        if use_triton_mqa_logits():
+            # fp8_mqa_logits_triton scores BF16 copies of a chunk's Q and
+            # gathered K, alive together with the chunk's logits.
+            max_logits_bytes += (
+                q_quant.numel() + total_seq_lens * head_dim
+            ) * torch.bfloat16.itemsize
         _ = torch.empty(
             max_logits_bytes, dtype=torch.uint8, device=hidden_states.device
         )
