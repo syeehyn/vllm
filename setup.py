@@ -1570,25 +1570,28 @@ SKIP_FLASH_ATTN = "VLLM_SKIP_FLASH_ATTN" in os.environ
 MINIMAL_SM80_BUILD = "VLLM_SM80_MINIMAL_BUILD" in os.environ
 
 
-def _targets_sm90() -> bool:
-    """Whether the requested CUDA architectures include SM90.
+def _targets_sm90_or_newer() -> bool:
+    """Whether any requested CUDA architecture is SM90 or newer.
 
     FA3 is Hopper-only: vllm-flash-attn gives its sources gencode flags only
     when 9.0 is a target arch, and without them the FA3 target fails to
-    compile. Only an explicit numeric ``TORCH_CUDA_ARCH_LIST`` is inspected;
-    an unset or named list is resolved by torch's CMake and keeps FA3.
+    compile. Only an explicit numeric `TORCH_CUDA_ARCH_LIST` whose every arch
+    is older than 9.0 drops FA3; an unset or named list is resolved by torch's
+    CMake, and any other list builds as before.
     """
     archs = re.findall(r"[^;,\s]+", os.environ.get("TORCH_CUDA_ARCH_LIST", ""))
-    numeric = all(re.fullmatch(r"\d+\.\d+[af]?(\+PTX)?", arch) for arch in archs)
-    if not archs or not numeric:
+    versions = [re.fullmatch(r"(\d+\.\d+)[af]?(\+PTX)?", arch) for arch in archs]
+    if not archs or not all(versions):
         return True
-    return any(arch.startswith("9.0") for arch in archs)
+    return any(float(version.group(1)) >= 9.0 for version in versions if version)
 
 
 if _is_cuda() and not SKIP_FLASH_ATTN:
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
     if USE_PRECOMPILED_EXTENSIONS or (
-        CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3") and _targets_sm90()
+        CUDA_HOME
+        and get_nvcc_cuda_version() >= Version("12.3")
+        and _targets_sm90_or_newer()
     ):
         # FA3 requires CUDA 12.3 or later
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
